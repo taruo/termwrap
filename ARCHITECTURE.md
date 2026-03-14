@@ -1,10 +1,8 @@
 ﻿# termwrap アーキテクチャ
 
 ## 方針
-- `termwrap` は `sshwrap` から独立した別プロダクトとして継続開発する
 - 接続プロトコルは `ssh` と `telnet` をサポートする
 - `--protocol` 未指定時は `ssh` を既定にする
-- このプロジェクトではソースファイル名にバージョン番号を付けず、最新実装のみを保持する
 
 ## 構成
 - 実行ファイルは `termwrap.exe` の 1 本に集約する
@@ -13,7 +11,7 @@
 - Telnet 自前実装は `TelnetTransport.cs`
 - named pipe の ACL 生成は `PipeSecurityFactory.cs`
 - ビルドは `build.ps1` から `csc` で行う
-- 旧版ソースや一時検証 artefact は `old\` 配下へ退避し、ルート直下は現行版だけを保つ
+- 旧版ソースや一時検証 artefact はローカルでは `old\` 配下へ退避できる
 
 ## セッションモデル
 - `start` 実行時にバックグラウンド daemon プロセスを起動する
@@ -58,6 +56,7 @@
 - セッションごとの受信内容は `output.log` に保存する
 - 障害解析時はまず `termwrap.log` と対象セッションの `session.info` / `output.log` を見る
 - `.termwrap-sessions` は実行時作業領域なので、配布物には含めない
+- `termwrap.exe` は GitHub Releases の asset 配布を前提とし、Git 管理対象には含めない
 
 ## 主要コマンド
 - `[--log-folder PATH] start [--session SESSION] --host HOST [--protocol ssh|telnet] [--port PORT] [--user USER] [--password PASSWORD] [--login-prompt TEXT] [--password-prompt TEXT] [--legacy-ssh] [--wait-ready] [ssh-args...]`

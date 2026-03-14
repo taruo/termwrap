@@ -1,5 +1,6 @@
 .termwrap-sessions/
 old/
+termwrap.exe
 *.log
 test-logs/
 tail_wait_test.log
