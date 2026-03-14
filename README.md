@@ -2,6 +2,8 @@
 
 `termwrap` は、AI から呼び出して CLI 操作を継続実行できるようにするための、Windows 用 SSH/Telnet セッションラッパーです。
 
+配布用の `termwrap.exe` は GitHub Releases から取得できます。
+
 ## できること
 - `ssh` と `telnet` の両方を扱えます
 - 接続は daemon プロセスとして維持されます
