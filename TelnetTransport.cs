@@ -113,6 +113,8 @@ namespace TermWrap
                     break;
                 }
 
+                // Telnet control bytes are carried inline with normal output, so
+                // strip negotiation here and expose only terminal data upward.
                 int command = _network.ReadByte();
                 if (command < 0)
                 {

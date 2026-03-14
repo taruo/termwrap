@@ -174,6 +174,8 @@ namespace TermWrap
             {
                 Thread.Sleep(StartReadyPollIntervalMs);
                 SessionInfo info = SessionInfo.Load(options.SessionName);
+                // Returning only after the pipe answers avoids a race where start
+                // succeeds but the very first read/send still hits a timeout.
                 if (info.IsAlive() && IsCommandPipeReady(options.SessionName) && (!options.WaitReady || IsSessionReady(options)))
                 {
                     Console.WriteLine("started " + options.SessionName);
@@ -247,6 +249,8 @@ namespace TermWrap
                 try
                 {
                     SendSimpleCommand(options.SessionName, "STOP");
+                    // STOP is asynchronous; wait briefly so prune does not race a
+                    // daemon that is still unwinding its child process.
                     WaitForSessionExit(options.SessionName, StopExitTimeoutMs);
                 }
                 catch (InvalidOperationException ex)
@@ -654,6 +658,8 @@ namespace TermWrap
             GlobalOptions options = new GlobalOptions();
             List<string> remaining = new List<string>();
             int index = 0;
+            // Treat only the leading options as global so later command arguments
+            // can freely contain strings such as "--log-folder".
             while (index < args.Length)
             {
                 if (args[index] == "--log-folder")
