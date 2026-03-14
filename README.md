@@ -10,6 +10,12 @@
 - `stop --prune` で停止と掃除をまとめて行えます
 - 実行中セッションが 1 つだけなら `--session` を省略できます
 
+## 公開前に知っておくべきこと
+- `--password` に渡した値は、環境によってはプロセス一覧、コマンド履歴、ログ取得時の記録に残る可能性があります
+- SSH 接続では、`StrictHostKeyChecking` を明示しない場合に `no` を付与します
+- そのため、信頼できないネットワークや未知ホスト相手に既定設定のまま使うのは安全寄りではありません
+- 公開版では旧版ソースや検証 artefact を `old\` に退避していますが、公開リポジトリには含めない方針です
+
 ## ファイル構成
 - `termwrap.exe`
   実行ファイルです
@@ -23,8 +29,6 @@
   named pipe ACL の生成です
 - `ARCHITECTURE.md`
   実装方針と内部設計です
-- `old\`
-  退避した旧版ファイルと検証 artefact を置く場所です
 
 ## 保存先
 セッション情報は `termwrap.exe` と同じ階層の `.termwrap-sessions` に保存します。
@@ -190,32 +194,11 @@
 - `read` `tail` `send` `stop` は、実行中セッションが 1 つだけなら `--session` を省略できます
 - 実行中セッションが複数ある場合は `--session` が必要です
 
-## 代表的な使い方
-### SSH で接続してコマンドを送る
-```powershell
-.\termwrap.exe start --host HOST --user USER --password PASSWORD --wait-ready
-.\termwrap.exe send --text "uname -a"
-.\termwrap.exe send --control enter
-.\termwrap.exe read --clear
-.\termwrap.exe stop --prune
-```
-
-### Telnet でログインして追尾する
-```powershell
-.\termwrap.exe start --host HOST --protocol telnet --port 23 --user USER --password PASSWORD --wait-ready
-.\termwrap.exe tail
-```
-
-### デバッグログを残す
-```powershell
-.\termwrap.exe --log-folder LOGS start --host HOST --user USER --password PASSWORD --wait-ready
-```
-
 ## SSH の扱い
 - Windows の `ssh.exe` を使って標準入出力をラップします
 - `--user` 指定時は `-l` を追加します
 - TTY 指定が無い場合は `-tt` を追加します
-- `StrictHostKeyChecking` 未指定時は `no` を追加します
+- `StrictHostKeyChecking` を明示しない場合は `no` を追加します
 - `UserKnownHostsFile` はセッション配下の `known_hosts` を使います
 - `--password` 指定時は一時的な `askpass.cmd` を作り、`SSH_ASKPASS` で渡します
 - `--legacy-ssh` は古い機器向けの互換オプションです
@@ -252,13 +235,17 @@
 実行中が 1 つだけなら省略できます。
 
 ## リリース時の扱い
-- ルート直下には実行に必要なソース、ドキュメント、ビルドスクリプト、`termwrap.exe` だけを残します
-- 旧版ファイルや一時検証 artefact は `old\` 配下へ退避します
-- `.termwrap-sessions` は実行時に生成される作業領域なので、配布物には含めません
+- ルート直下には現行ソース、ドキュメント、ビルドスクリプト、実行ファイルだけを置きます
+- `old\` はローカル退避用であり、Git 管理や公開対象には含めません
+- `.termwrap-sessions` は実行時作業領域なので、配布物には含めません
 
 ## 関連ファイル
+- `LICENSE`
 - [ARCHITECTURE.md](./ARCHITECTURE.md)
 - `Program.cs`
 - `SessionSupport.cs`
 - `TelnetTransport.cs`
 - `PipeSecurityFactory.cs`
+
+## ライセンス
+MIT License です。詳細は `LICENSE` を参照してください。

@@ -1,4 +1,5 @@
 .termwrap-sessions/
+old/
 *.log
 test-logs/
 tail_wait_test.log
