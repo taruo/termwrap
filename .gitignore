@@ -1,0 +1,8 @@
+.termwrap-sessions/
+*.log
+test-logs/
+tail_wait_test.log
+tail_wait_test.out
+tail_wait_test.err
+*.user
+*.tmp
