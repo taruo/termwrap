@@ -1,2 +1,2 @@
 # termwrap
-Windows SSH/Telnet Wrapper CLI for AI 
+Windows SSH/Telnet Terminal Wrapper CLI for AI 
