@@ -1,6 +1,6 @@
 # termwrap
 
-`termwrap` は Windows 上で `ssh` / `telnet` の接続をバックグラウンドで維持し、あとから `read` `tail` `send` `stop` で操作できる CLI です。
+`termwrap` は、AI から呼び出して CLI 操作を継続実行できるようにするための、Windows 用 SSH/Telnet セッションラッパーです。
 
 ## できること
 - `ssh` と `telnet` の両方を扱えます
