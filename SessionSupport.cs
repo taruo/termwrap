@@ -553,6 +553,7 @@ namespace TermWrap
         private readonly string _outputLog;
         private readonly string _sessionKnownHostsFile;
         private readonly TailBuffer _tailBuffer;
+        private readonly TailBuffer _readBuffer;
         private readonly object _sync = new object();
         private readonly DateTime _startedAtUtc;
         private Mutex _mutex;
@@ -581,6 +582,7 @@ namespace TermWrap
             _outputLog = Path.Combine(_sessionDir, "output.log");
             _sessionKnownHostsFile = SessionPaths.GetSessionKnownHostsFile(_sessionName);
             _tailBuffer = new TailBuffer(1024 * 1024);
+            _readBuffer = new TailBuffer(1024 * 1024);
             _startedAtUtc = DateTime.UtcNow;
             ParsePromptConfig(promptConfig);
         }
@@ -776,8 +778,8 @@ namespace TermWrap
                     return "OK pong";
                 }
 
-                if (string.Equals(command, "READ", StringComparison.Ordinal)) { return EncodeSnapshot("READ", _tailBuffer.ReadAll()); }
-                if (string.Equals(command, "READ_CLEAR", StringComparison.Ordinal)) { return EncodeSnapshot("READ_CLEAR", _tailBuffer.ReadAllAndClear()); }
+                if (string.Equals(command, "READ", StringComparison.Ordinal)) { return EncodeSnapshot("READ", _readBuffer.ReadAll()); }
+                if (string.Equals(command, "READ_CLEAR", StringComparison.Ordinal)) { return EncodeSnapshot("READ_CLEAR", _readBuffer.ReadAllAndClear()); }
                 if (command.StartsWith("TAIL ", StringComparison.Ordinal))
                 {
                     long offset = long.Parse(command.Substring(5), CultureInfo.InvariantCulture);
@@ -836,6 +838,7 @@ namespace TermWrap
                         _outputFile.Write(buffer, 0, read);
                         _outputFile.Flush();
                         _tailBuffer.Append(buffer, read);
+                        _readBuffer.Append(buffer, read);
                         if (sourceName == "stderr")
                         {
                             AppendStderrTail(buffer, read);

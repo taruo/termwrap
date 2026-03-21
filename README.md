@@ -142,6 +142,7 @@ AI sandbox から起動した場合に `start` 成功後すぐセッションが
 
 - `--clear`
   読み取った内容をバッファから消します
+- `read --clear` は `read` 用の未読バッファだけを消し、`tail` 用の履歴バッファは消しません
 
 ### tail
 ```powershell
@@ -150,6 +151,7 @@ AI sandbox から起動した場合に `start` 成功後すぐセッションが
 
 - `--wait`
   対象セッションが実行中になるまで待ってから追尾します
+- `tail` は `read --clear` と独立した履歴バッファを読みます
 
 ### send
 ```powershell
