@@ -123,6 +123,7 @@
   command pipe ready に加えて、初回プロンプトが見えるまで待ってから戻ります
 
 `start` は command pipe の `PING` に応答できる状態になってから成功を返します。
+AI sandbox から起動した場合に `start` 成功後すぐセッションが落ちるなら、`start` だけ sandbox 昇格して再実行してください。
 
 ### list
 ```powershell
@@ -158,6 +159,7 @@
 ```
 
 `--text` `--hex` `--control` は 1 つだけ指定できます。
+`--text` は文字列だけを送信し、Enter は含みません。改行や実行確定は `--control enter` を別に送ってください。
 
 `--control` の例:
 - `ctrl-c`
