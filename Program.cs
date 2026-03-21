@@ -21,6 +21,8 @@ namespace TermWrap
         private const int TailPollIntervalMs = 2000;
         private const int StartReadyTimeoutMs = 8000;
         private const int StartReadyPollIntervalMs = 200;
+        private const int StartStableWindowMs = 1500;
+        private const int StartStablePollIntervalMs = 200;
         private const int StopExitTimeoutMs = 5000;
         private const int StopExitPollIntervalMs = 100;
         private static string _currentLogFolder;
@@ -178,17 +180,23 @@ namespace TermWrap
                 // succeeds but the very first read/send still hits a timeout.
                 if (info.IsAlive() && IsCommandPipeReady(options.SessionName) && (!options.WaitReady || IsSessionReady(options)))
                 {
+                    if (options.Protocol == ConnectionProtocol.Ssh && !WaitForSshStartupStability(options.SessionName, process))
+                    {
+                        throw new InvalidOperationException(BuildStartFailureMessage(options.SessionName, "ssh transport exited during startup stabilization"));
+                    }
+
                     Console.WriteLine("started " + options.SessionName);
+                    Console.WriteLine("warning: if this is being run from an AI sandbox, this start command is likely to fail after launch. Re-run only the start command with sandbox escalation.");
                     return 0;
                 }
 
                 if (process.HasExited)
                 {
-                    throw new InvalidOperationException("daemon exited before session became ready");
+                    throw new InvalidOperationException(BuildStartFailureMessage(options.SessionName, "daemon exited before session became ready"));
                 }
             }
 
-            throw new InvalidOperationException("session did not become ready in time");
+            throw new InvalidOperationException(BuildStartFailureMessage(options.SessionName, "session did not become ready in time"));
         }
 
         private static bool IsCommandPipeReady(string sessionName)
@@ -227,6 +235,78 @@ namespace TermWrap
                 Logger.Info("start ready wait session={0} detail={1}", options.SessionName, ex.Message);
                 return false;
             }
+        }
+
+        private static bool WaitForSshStartupStability(string sessionName, Process daemonProcess)
+        {
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(StartStableWindowMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(StartStablePollIntervalMs);
+                SessionInfo info = SessionInfo.Load(sessionName);
+                if (!info.IsAlive() || daemonProcess.HasExited)
+                {
+                    return false;
+                }
+
+                if (!IsCommandPipeReady(sessionName))
+                {
+                    return false;
+                }
+
+                if (info.RemotePid <= 0 || !IsProcessAlive(info.RemotePid))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool IsProcessAlive(int pid)
+        {
+            if (pid <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                return !Process.GetProcessById(pid).HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string BuildStartFailureMessage(string sessionName, string fallbackMessage)
+        {
+            SessionInfo info = SessionInfo.Load(sessionName);
+            string detail = string.IsNullOrEmpty(info.LastError) ? string.Empty : info.LastError.Trim();
+            string message = string.IsNullOrEmpty(detail) ? fallbackMessage : fallbackMessage + ": " + detail;
+            if (LooksLikeSandboxLaunchFailure(detail))
+            {
+                message += " If an AI tool or sandbox launched this command, retry only the start command with sandbox escalation so ssh.exe can be started.";
+            }
+
+            return message;
+        }
+
+        private static bool LooksLikeSandboxLaunchFailure(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return false;
+            }
+
+            string text = message.ToLowerInvariant();
+            return text.Contains("access is denied")
+                || text.Contains("permission denied")
+                || text.Contains("operation not permitted")
+                || text.Contains("requested operation requires elevation")
+                || text.Contains("this program is blocked")
+                || text.Contains("the system cannot execute");
         }
 
         private static int StopCommand(string[] args)
@@ -1112,6 +1192,7 @@ namespace TermWrap
             Console.WriteLine("  --legacy-ssh  add ssh-rsa / hmac-sha1 compatibility options");
             Console.WriteLine("  --wait-ready  wait for the first shell prompt before returning");
             Console.WriteLine("  --log-folder  optional; write termwrap.log only when specified");
+            Console.WriteLine("  note          if an AI sandbox causes start to fail after launch, rerun only start with sandbox escalation");
             Console.WriteLine();
             Console.WriteLine("Read session output");
             Console.WriteLine("  termwrap.exe read [--session SESSION] [--clear]");
@@ -1125,6 +1206,7 @@ namespace TermWrap
             Console.WriteLine("  termwrap.exe send [--session SESSION] --text TEXT");
             Console.WriteLine("  termwrap.exe send [--session SESSION] --hex HEX");
             Console.WriteLine("  termwrap.exe send [--session SESSION] --control <ctrl-c|ctrl-d|ctrl-z|esc|tab|enter|up|down|left|right|backspace>");
+            Console.WriteLine("  note          --text sends only the text itself; press Enter separately with --control enter");
             Console.WriteLine();
             Console.WriteLine("Stop and clean up");
             Console.WriteLine("  termwrap.exe stop [--session SESSION] [--clear-stale] [--prune]");

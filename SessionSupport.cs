@@ -287,6 +287,9 @@ namespace TermWrap
         public string Target;
         public string AuthMode;
         public string Status;
+        public string LastError;
+        public string ExitReason;
+        public string StderrTail;
 
         public bool IsAlive()
         {
@@ -334,6 +337,9 @@ namespace TermWrap
                 else if (key == "target") { info.Target = value; }
                 else if (key == "authMode") { info.AuthMode = value; }
                 else if (key == "status") { info.Status = value; }
+                else if (key == "lastError") { info.LastError = value; }
+                else if (key == "exitReason") { info.ExitReason = value; }
+                else if (key == "stderrTail") { info.StderrTail = value; }
             }
 
             return info;
@@ -557,6 +563,9 @@ namespace TermWrap
         private string _loginPrompt;
         private string _passwordPrompt;
         private string _recentText = string.Empty;
+        private string _lastError = string.Empty;
+        private string _exitReason = string.Empty;
+        private string _stderrTail = string.Empty;
 
         public SessionDaemon(string sessionName, string protocol, string host, string transportPath, string transportArguments, string userName, string password, string promptConfig)
         {
@@ -597,6 +606,7 @@ namespace TermWrap
                 Thread stdoutThread = StartPumpThread(_transport.OutputStream, "stdout");
                 Thread stderrThread = _transport.ErrorStream == null ? null : StartPumpThread(_transport.ErrorStream, "stderr");
                 Thread commandThread = StartCommandServerThread();
+                Thread transportMonitorThread = StartTransportMonitorThread();
                 Logger.Info("daemon loop start session={0} transport={1} state={2}", _sessionName, _transport.ProtocolName, _transport.DescribeState());
 
                 while (!_stopping && !_transport.HasExited)
@@ -610,14 +620,24 @@ namespace TermWrap
                     _stopping,
                     _transport.HasExited,
                     _transport.DescribeState());
+                _exitReason = _stopping ? "stop requested" : "transport exited";
                 _stopping = true;
                 _transport.Stop();
                 if (stdoutThread != null) { stdoutThread.Join(1000); }
                 if (stderrThread != null) { stderrThread.Join(1000); }
                 if (commandThread != null) { commandThread.Join(1000); }
+                if (transportMonitorThread != null) { transportMonitorThread.Join(1000); }
                 WriteMetadata();
                 Logger.Info("daemon shutdown complete session={0}", _sessionName);
                 return 0;
+            }
+            catch (Exception ex)
+            {
+                _lastError = ex.Message;
+                _exitReason = "exception";
+                WriteMetadata();
+                Logger.Error("daemon startup/run failed session=" + _sessionName + " " + ex);
+                throw;
             }
             finally
             {
@@ -665,6 +685,31 @@ namespace TermWrap
             thread.IsBackground = true;
             thread.Start();
             return thread;
+        }
+
+        private Thread StartTransportMonitorThread()
+        {
+            Thread thread = new Thread(new ThreadStart(MonitorTransportExit));
+            thread.IsBackground = true;
+            thread.Start();
+            return thread;
+        }
+
+        private void MonitorTransportExit()
+        {
+            while (!_stopping && _transport != null && !_transport.HasExited)
+            {
+                Thread.Sleep(100);
+            }
+
+            if (_transport == null || _stopping)
+            {
+                return;
+            }
+
+            _exitReason = "transport exited: " + _transport.DescribeState();
+            WriteMetadata();
+            Logger.Info("transport exit monitor session={0} state={1}", _sessionName, _transport.DescribeState());
         }
 
         private void RunCommandServer()
@@ -791,6 +836,10 @@ namespace TermWrap
                         _outputFile.Write(buffer, 0, read);
                         _outputFile.Flush();
                         _tailBuffer.Append(buffer, read);
+                        if (sourceName == "stderr")
+                        {
+                            AppendStderrTail(buffer, read);
+                        }
                     }
 
                     if (string.Equals(_protocol, "telnet", StringComparison.OrdinalIgnoreCase))
@@ -807,6 +856,16 @@ namespace TermWrap
                 {
                     Logger.Error("stream pump error session=" + _sessionName + " source=" + sourceName + " " + ex.Message);
                 }
+            }
+        }
+
+        private void AppendStderrTail(byte[] buffer, int count)
+        {
+            string chunk = Encoding.UTF8.GetString(buffer, 0, count);
+            _stderrTail = _stderrTail + chunk;
+            if (_stderrTail.Length > 512)
+            {
+                _stderrTail = _stderrTail.Substring(_stderrTail.Length - 512);
             }
         }
 
@@ -910,7 +969,10 @@ namespace TermWrap
                     "knownHostsFile=" + _sessionKnownHostsFile,
                     "target=" + (_transport == null ? _transportArguments : _transport.TargetDescription),
                     "startedAtUtc=" + _startedAtUtc.ToString("o", CultureInfo.InvariantCulture),
-                    "status=" + (_stopping ? "stopping" : (_transport != null && !_transport.HasExited ? "running" : "stopped"))),
+                    "status=" + (_stopping ? "stopping" : (_transport != null && !_transport.HasExited ? "running" : "stopped")),
+                    "lastError=" + _lastError.Replace("\r", " ").Replace("\n", " "),
+                    "exitReason=" + _exitReason.Replace("\r", " ").Replace("\n", " "),
+                    "stderrTail=" + _stderrTail.Replace("\r", " ").Replace("\n", " ")),
                 Encoding.UTF8);
         }
 
