@@ -1,252 +1,208 @@
 # termwrap
 
-`termwrap` は、AI から呼び出して CLI 操作を継続実行できるようにするための、Windows 用 SSH/Telnet セッションラッパーです。
+English documentation: [README.en.md](README.en.md)
 
-配布用の `termwrap.exe` は GitHub Releases から取得できます。
-
-## できること
-- `ssh` と `telnet` の両方を扱えます
-- 接続は daemon プロセスとして維持されます
-- 出力確認は `read` または `tail` で行えます
-- 入力送信は `send` で 1 操作ずつ行えます
-- `stop --prune` で停止と掃除をまとめて行えます
-- 実行中セッションが 1 つだけなら `--session` を省略できます
-
-## ファイル構成
-- `termwrap.exe`
-  実行ファイルです。公開時は GitHub Releases の asset 配布を前提とします
-- `Program.cs`
-  CLI 入口、引数解析、help、start/stop/list/read/tail/send を持ちます
-- `SessionSupport.cs`
-  セッション情報、named pipe、tail バッファ、ログ、SSH 補助を持ちます
-- `TelnetTransport.cs`
-  Telnet 通信の実装です
-- `PipeSecurityFactory.cs`
-  named pipe ACL の生成です
-- `ARCHITECTURE.md`
-  実装方針と内部設計です
-
-## 保存先
-セッション情報は `termwrap.exe` と同じ階層の `.termwrap-sessions` に保存します。
-
-例:
-- `.termwrap-sessions\ssh-001\session.info`
-- `.termwrap-sessions\ssh-001\output.log`
-- `.termwrap-sessions\ssh-001\known_hosts`
-
-`output.log` には受信内容を追記保存します。
-
-## ログ方針
-アプリ全体ログはデフォルトでは作りません。
-
-`--log-folder PATH` を指定したときだけ、次の場所に `termwrap.log` を出力します。
-- `<PATH>\termwrap.log`
-
-作らないもの:
-- `.termwrap-data`
-- `termwrap.log` の自動生成
-
-## ビルド
-```powershell
-.\build.ps1
-```
-
-生成物:
-- `termwrap.exe`
+AIやスクリプトから SSH / Telnet の対話セッションを継続操作する Windows 用ラッパーです。
+配布用 `termwrap.exe` は GitHub Releases の asset で提供します。
 
 ## クイックスタート
-### SSH で接続
+
 ```powershell
-.\termwrap.exe start --host HOST --user USER --password PASSWORD --wait-ready
+# 接続（パスワードは画面に表示せず入力）
+.\termwrap.exe start --host HOST --user USER -s main --ask-password
+
+# 一行をEnter付きで送る
+.\termwrap.exe send -s main --line "uname -a"
+.\termwrap.exe read -s main --clear
+
+# 接続を終了し、保存データを削除
+.\termwrap.exe stop -s main
+.\termwrap.exe prune -s main
 ```
 
-### Telnet で接続
-```powershell
-.\termwrap.exe start --host HOST --protocol telnet --port 23 --user USER --password PASSWORD --wait-ready
+SSHが既定です。Telnetは `--protocol telnet` を指定します。
+ポートの既定は SSH=22、Telnet=23 です。接続名を省略すると
+`ssh-001` / `telnet-001` のように自動採番します。
+
+## 共通ルール
+
+```text
+termwrap [--json] [--log-folder PATH] <command> [options]
+termwrap <command> [options] [--json] [--log-folder PATH]
 ```
 
-### 出力を読む
-```powershell
-.\termwrap.exe read --clear
-```
+- `-s NAME` は `--session NAME` と同じです。
+- `read` / `tail` / `send` / `stop` の対象省略は、実行中が1件の場合だけです。
+- `prune` の対象省略は、停止済みを含む既知セッションが1件の場合だけです。
+- `stop --all` は全セッションを停止しますが、保存データは削除しません。削除は常に1セッションずつです。
+- `--json` と `--log-folder` はコマンドの前後に置けます。
+- オプション値と `--` 以降の引数は共通オプションとして解釈しません。
+  例えば `send --text "--json"` は文字列 `--json` を送信します。
+- 不明なオプション、重複した値オプション、排他的オプションの併用はエラーです。
+- `termwrap help`、`termwrap help start`、`termwrap start --help` で説明を表示します。
+- セッション名は文字・数字・`-`・`_`・`.` を使用でき、`.` / `..` は禁止です。
 
-### 1 コマンドずつ送る
-```powershell
-.\termwrap.exe send --text "uname -a"
-.\termwrap.exe send --control enter
-.\termwrap.exe read --clear
-```
-
-### 停止して掃除する
-```powershell
-.\termwrap.exe stop --prune
-```
-
-## セッション名
-### 明示する場合
-```powershell
-.\termwrap.exe start --session ssh-main --host HOST --user USER --password PASSWORD
-```
-
-### 省略する場合
-`start` で `--session` を省略すると、次の形式で自動採番します。
-- SSH: `ssh-001`, `ssh-002`, ...
-- Telnet: `telnet-001`, `telnet-002`, ...
-
-採用されたセッション名は `start` 成功時に表示されます。
-
-## コマンド一覧
-### 共通形式
-```powershell
-.\termwrap.exe [--log-folder PATH] <command> ...
-```
-
-- `--log-folder PATH`
-  指定した場合だけ `<PATH>\termwrap.log` を出力します
+## コマンド
 
 ### start
-```powershell
-.\termwrap.exe [--log-folder PATH] start [--session SESSION] --host HOST [--protocol ssh|telnet] [--port PORT] [--user USER] [--password PASSWORD] [--login-prompt TEXT] [--password-prompt TEXT] [--legacy-ssh] [--wait-ready] [ssh-args...]
+
+```text
+termwrap start --host HOST [-s NAME] [--protocol ssh|telnet] [--port PORT]
+    [--user USER] [--ask-password | --password-stdin | --password VALUE]
+    [--login-prompt TEXT] [--password-prompt TEXT] [--legacy-ssh]
+    [--wait-ready] [-- SSH-ARGS...]
 ```
 
-- `--host`
-  必須です
-- `--protocol`
-  省略時は `ssh` です
-- `--port`
-  省略時は `ssh=22`, `telnet=23` です
-- `--session`
-  省略時は自動採番です
-- `--legacy-ssh`
-  古い SSH 機器向けの `ssh-rsa` / `hmac-sha1` 互換オプションをまとめて有効にします
-- `--wait-ready`
-  command pipe ready に加えて、初回プロンプトが見えるまで待ってから戻ります
+- `--ask-password`: 対話コンソールで非表示入力します。入力リダイレクト時は使えません。
+- `--password-stdin`: 標準入力からUTF-8の1行を読みます。改行だけを除去し、前後の空白を保持します。
+  EOFと空の1行は区別します。UTF-8を出力する秘密管理ツール等から渡してください。
+- `--password VALUE`: 互換用です。呼び出し元のプロセス引数やシェル履歴に値が残り得るため、
+  新規自動処理では `--password-stdin` を推奨します。
+- 認証入力方式は3種類のうち1つだけ指定できます。省略時はSSH鍵等の既存設定を使います。
+- `--wait-ready`: daemonの応答に加え、従来のプロンプト判定で準備完了を待ちます。
+  起動待機の期限は8秒です。任意の機器のプロンプトを保証するものではありません。
+- `--login-prompt` / `--password-prompt`: Telnet自動ログイン時の検出文字列です。
+- `--legacy-ssh`: 古いSSH機器向けに `ssh-rsa` / `hmac-sha1` 互換設定を追加します。
+- SSHへ直接渡す引数は必ず `--` の後ろに指定します。
 
-`start` は command pipe の `PING` に応答できる状態になってから成功を返します。
-AI sandbox から起動した場合に `start` 成功後すぐセッションが落ちるなら、`start` だけ sandbox 昇格して再実行してください。
-
-### list
 ```powershell
-.\termwrap.exe list [--all] [--verbose]
+.\termwrap.exe start --host HOST --user USER -s main -- -o ConnectTimeout=10
+.\termwrap.exe start --host HOST --protocol telnet --port 23 -s console
 ```
 
-- `--all`
-  停止済みも表示します
-- `--verbose`
-  `pid`, `remotePid`, `auth`, `target` まで表示します
-
-### read
-```powershell
-.\termwrap.exe read [--session SESSION] [--clear]
-```
-
-- `--clear`
-  読み取った内容をバッファから消します
-- `read --clear` は `read` 用の未読バッファだけを消し、`tail` 用の履歴バッファは消しません
-
-### tail
-```powershell
-.\termwrap.exe tail [--session SESSION] [--wait]
-```
-
-- `--wait`
-  対象セッションが実行中になるまで待ってから追尾します
-- `tail` は `read --clear` と独立した履歴バッファを読みます
+SSHはWindowsの `ssh.exe` を使用します。TTY指定がなければ `-tt` を追加します。
+従来どおり `StrictHostKeyChecking` 未指定時は `no`、
+`UserKnownHostsFile` はセッション配下、`GlobalKnownHostsFile` は
+`C:\ProgramData\ssh\ssh_known_hosts` を使用します。
 
 ### send
-```powershell
-.\termwrap.exe send [--session SESSION] --text TEXT
-.\termwrap.exe send [--session SESSION] --hex HEX
-.\termwrap.exe send [--session SESSION] --control CONTROL
+
+```text
+termwrap send [-s NAME] (--text TEXT | --line TEXT | --hex HEX | --key KEY)
 ```
 
-`--text` `--hex` `--control` は 1 つだけ指定できます。
-`--text` は文字列だけを送信し、Enter は含みません。改行や実行確定は `--control enter` を別に送ってください。
+- `--text`: UTF-8の文字列をそのまま送り、Enterは付けません。空文字も指定できます。
+- `--line`: UTF-8の文字列と末尾のCR（Enter）を1回の要求で送ります。
+  空文字はEnterだけです。文字列内のCR/LFは拒否します。
+- `--hex`: 生バイトを送ります。16進数字の間の空白・ハイフンは無視します。
+- `--key`: `ctrl-c`、`ctrl-d`、`ctrl-z`、`esc`、`tab`、`enter`、
+  `up`、`down`、`left`、`right`、`backspace` が使えます。
+- 互換用の `--control` は `--key` と同じです。
+- 成功は「入力を送信した」意味です。リモートコマンドの完了や成功は `read` 等で確認します。
 
-`--control` の例:
-- `ctrl-c`
-- `ctrl-d`
-- `ctrl-z`
-- `esc`
-- `tab`
-- `enter`
-- `up`
-- `down`
-- `left`
-- `right`
-- `backspace`
+### read / tail
 
-### stop
-```powershell
-.\termwrap.exe stop [--session SESSION] [--clear-stale] [--prune]
+```text
+termwrap read [-s NAME] [--clear]
+termwrap tail [-s NAME] [--wait]
 ```
 
-- `--clear-stale`
-  応答しない古いセッション情報を強制的に掃除します
-- `--prune`
-  停止後にセッションディレクトリも削除します
+`read --clear` は未読バッファを読み出して消去します。`tail` の履歴は消しません。
+`tail --wait` は指定セッションの起動、または実行中セッションが1件になるまで待ちます。
+複数候補があればエラーです。追尾間隔は2秒、Ctrl+Cで終了します。
+バッファはメモリ上の直近1MiBです。停止後の出力はセッションの `output.log` を参照します。
 
-`stop --prune` は `STOP` 送信後、daemon が落ちるまで短時間待ってから削除します。`--session` なしなら既知セッションを全件掃除します。
+### list
 
-## セッション選択ルール
-- `start` は `--host` 必須です
-- `start` の `--session` は任意です
-- `read` `tail` `send` `stop` は、実行中セッションが 1 つだけなら `--session` を省略できます
-- 実行中セッションが複数ある場合は `--session` が必要です
-
-## SSH の扱い
-- Windows の `ssh.exe` を使って標準入出力をラップします
-- `--user` 指定時は `-l` を追加します
-- TTY 指定が無い場合は `-tt` を追加します
-- `StrictHostKeyChecking` を明示しない場合は `no` を追加します
-- `UserKnownHostsFile` はセッション配下の `known_hosts` を使います
-- `--password` 指定時は一時的な `askpass.cmd` を作り、`SSH_ASKPASS` で渡します
-- `--legacy-ssh` は古い機器向けの互換オプションです
-
-## Telnet の扱い
-- `telnet.exe` には依存せず、内部実装で接続します
-- 既定ポートは `23` です
-- Telnet IAC シーケンスを処理して通常データだけを表示します
-- `--user` と `--password` を指定した場合は `login:` / `password:` を見て自動ログインします
-
-## トラブルシュート
-### `read` が失敗する
-まず一覧を確認します。
-
-```powershell
-.\termwrap.exe list --all --verbose
+```text
+termwrap list [--all|-a] [--verbose|-v]
 ```
 
-見る場所:
-- `.termwrap-sessions\<session>\session.info`
-- `.termwrap-sessions\<session>\output.log`
-- `--log-folder` を使っている場合は `<log-folder>\termwrap.log`
+既定では実行中のみ表示します。`--all` は停止済みも表示、
+`--verbose` は人間向け表示を詳細化します。
 
-### 古い SSH 機器で鍵方式エラーになる
-```powershell
-.\termwrap.exe start --host HOST --user USER --password PASSWORD --legacy-ssh
+### stop / prune
+
+```text
+termwrap stop [-s NAME | --all] [--force] [--prune]
+termwrap prune [-s NAME]
 ```
 
-### `--session` を省略できるか分からない
-```powershell
-.\termwrap.exe list --all --verbose
+- `stop`: 選択した接続を停止します。停止済みの明示対象は成功として扱います。
+- `stop --force`: 通常停止に失敗した場合も、記録されたプロセス情報に基づいて終了を試みます。
+  `--clear-stale` は互換用の別名です。
+- `prune`: 停止済みセッションのデータとログを削除します。接続は停止しません。
+- `prune --all` は危険な一括削除になるため、サポートしていません。対象を省略する場合も、既知セッションが1件のときだけです。
+- `prune -s NAME` で稼働中を指定すると終了コード6です。
+- `stop --prune` は互換用です。選択対象の停止後にデータを削除します。
+  `--all` との併用はできず、削除は選択した1セッションだけです。
+- 全件操作は順に処理します。途中でエラーが起きても、完了済みの処理は取り消しません。
+
+## JSONと終了コード
+
+`--json` 時、結果は標準出力、エラーは標準エラーにJSONで返します。
+通常コマンドは1オブジェクト、`tail` は1行1イベントのNDJSONです。
+
+```json
+{"ok":true,"command":"list","sessions":[]}
+{"ok":true,"command":"send","session":"main","mode":"line","sent":true}
+{"ok":false,"error":{"code":"not_found","message":"session is not running: main"}}
 ```
 
-実行中が 1 つだけなら省略できます。
+`list` の各セッションは `session`、`state`、`protocol`、`host`、`port`、
+`daemonPid`、`remotePid`、`startedAtUtc`、`authMode` を持ちます。
+`state` は `running` / `stopped` です。
 
-## リリース時の扱い
-- ルート直下には現行ソース、ドキュメント、ビルドスクリプト、実行ファイルだけを置きます
-- `old\` はローカル退避用であり、Git 管理や公開対象には含めません
-- `termwrap.exe` はローカルに残しますが、公開リポジトリには含めず GitHub Releases asset として配布します
-- `.termwrap-sessions` は実行時作業領域なので、配布物には含めません
+`read` と `tail` のデータイベントは `text`、`dataBase64`、`startOffset`、
+`endOffset`、`cleared` を持ちます。`text` はUTF-8として表示した文字列、
+`dataBase64` は元のバイト列です。分割されたUTF-8や非UTF-8出力を正確に扱う場合は
+`dataBase64` を連結してから復号してください。
+`tail` のイベント種別は `waiting`、`data`、`stopped` です。
 
-## 関連ファイル
-- `LICENSE`
-- [ARCHITECTURE.md](./ARCHITECTURE.md)
-- `Program.cs`
-- `SessionSupport.cs`
-- `TelnetTransport.cs`
-- `PipeSecurityFactory.cs`
+| 終了コード | error.code | 意味 |
+|---|---|---|
+| 0 | — | 成功 |
+| 1 | failure | 通信・OSエラーなど |
+| 2 | usage | 引数やオプションが不正 |
+| 3 | not_found | 対象がない、または実行していない |
+| 4 | ambiguous | 省略した対象が一意に決まらない |
+| 5 | timeout | 起動・停止・pipe接続の待機期限超過 |
+| 6 | conflict | 稼働中の削除など状態が競合 |
 
-## ライセンス
-MIT License です。詳細は `LICENSE` を参照してください。
+## 旧版からの移行
+
+従来の `--session`、`send --control`、`stop --clear-stale`、
+`stop --prune`、`read --clear` は引き続き使えます。
+次の2点は意図的な変更です。
+
+- 一括削除: `prune --all` と `stop --all --prune` は廃止しました。`stop --all` 後に、必要なセッションを `prune -s NAME` で個別に削除してください。
+- SSH追加引数: `start ... -o OPTION=VALUE` → `start ... -- -o OPTION=VALUE`
+
+既存daemonにも `send --line` は使えます（従来の文字送信要求でCRを一緒に送ります）。
+
+## 保存・ログ・認証情報
+
+セッションは実行ファイル直下の `.termwrap-sessions\NAME` に保存します。
+`session.info` は管理情報、`output.log` は受信した端末出力です。
+デバッグログは `--log-folder PATH` 指定時だけ `PATH\termwrap.log` に作成します。
+CLI引数全体、パスワード、送受信ペイロードはデバッグログに記録しません。
+接続先が画面に表示した秘密情報は `output.log` に含まれ得ます。
+
+パスワードは制限ACL付きの一時ファイルでdaemonに渡し、受領直後に削除します。
+SSHの `askpass.cmd` / `askpass.secret` も制限ACLで保護し、通常終了時に削除します。
+pipeの許可対象は現在ユーザー・SYSTEM・Administratorsです。
+
+## ビルドと検証
+
+```powershell
+.\build.ps1
+.\test.ps1
+```
+
+.NET Frameworkの `csc` と `System.Web.Extensions` を使用します。
+`build.ps1` は実行場所に依存せず `termwrap.exe` を生成し、失敗時はエラーを返します。
+`test.ps1` は一時フォルダへビルドし、ループバックの模擬Telnetサーバーと
+隔離セッションで検証します。実際のSSH接続や既存セッションは使いません。
+
+- `Program.cs`: コマンド実行とhelp
+- `CliOptions.cs`: 共通・コマンド別の引数解析、認証入力
+- `CliOutput.cs`: JSON出力、エラーコード
+- `SessionSupport.cs`: セッション、pipe、SSH、ログとバッファ
+- `TelnetTransport.cs`: Telnet通信
+- `PipeSecurityFactory.cs`: pipe ACL
+- `tests/CliRegression.cs`: CLI回帰試験
+- `ARCHITECTURE.md`: 日本語の設計資料
+
+Git公開にはソースを含め、`termwrap.exe` はRelease assetとして配布します。
+`.termwrap-sessions`、ログ、`old`、テスト成果物は公開対象外です。
+ライセンスはMITです（`LICENSE` 参照）。

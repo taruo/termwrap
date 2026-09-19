@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 
@@ -28,6 +30,8 @@ namespace TermWrap
         public string PasswordPrompt = "password:";
         public bool EnableLegacySsh;
         public bool WaitReady;
+        public bool AskPassword;
+        public bool PasswordStdin;
 
         public string GetPromptConfig()
         {
@@ -40,6 +44,7 @@ namespace TermWrap
         public string SessionName;
         public bool ClearStale;
         public bool Prune;
+        public bool All;
     }
 
     internal sealed class SessionCommandOptions
@@ -48,6 +53,7 @@ namespace TermWrap
         public bool Clear;
         public bool Wait;
         public string TextValue;
+        public string LineValue;
         public string HexValue;
         public string ControlValue;
     }
@@ -179,7 +185,21 @@ namespace TermWrap
 
         public static string GetSessionDir(string sessionName)
         {
-            return Path.Combine(SessionsRoot, Sanitize(sessionName));
+            string sanitized = Sanitize(sessionName);
+            if (sanitized == "." || sanitized == "..")
+            {
+                throw new InvalidOperationException("session name cannot be '.' or '..'");
+            }
+
+            string root = Path.GetFullPath(SessionsRoot);
+            string candidate = Path.GetFullPath(Path.Combine(root, sanitized));
+            string rootPrefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("session path escapes the sessions directory");
+            }
+
+            return candidate;
         }
 
         public static bool SessionDirectoryExists(string sessionName)
@@ -192,6 +212,7 @@ namespace TermWrap
             string dir = GetSessionDir(sessionName);
             if (Directory.Exists(dir))
             {
+                RejectReparsePoint(dir);
                 Directory.Delete(dir, true);
             }
         }
@@ -208,14 +229,139 @@ namespace TermWrap
 
         public static string Sanitize(string value)
         {
+            if (string.IsNullOrEmpty(value))
+            {
+                throw new InvalidOperationException("session name cannot be empty");
+            }
+
             StringBuilder builder = new StringBuilder(value.Length);
             for (int i = 0; i < value.Length; i++)
             {
                 char c = value[i];
-                builder.Append(char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.' ? c : '_');
+                if (!char.IsLetterOrDigit(c) && c != '-' && c != '_' && c != '.')
+                {
+                    throw new InvalidOperationException("session name contains an unsupported character: " + c);
+                }
+
+                builder.Append(c);
             }
 
             return builder.ToString();
+        }
+
+        public static void EnsureSecureSessionDirectory(string sessionName)
+        {
+            EnsureSecureDirectory(SessionsRoot);
+            EnsureSecureDirectory(GetSessionDir(sessionName));
+        }
+
+        private static void EnsureSecureDirectory(string path)
+        {
+            Directory.CreateDirectory(path);
+            RejectReparsePoint(path);
+            DirectorySecurity security = new DirectorySecurity();
+            security.SetAccessRuleProtection(true, false);
+            AddFullControlRules(security, true);
+            Directory.SetAccessControl(path, security);
+        }
+
+        private static void RejectReparsePoint(string path)
+        {
+            FileAttributes attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new InvalidOperationException("session paths cannot be reparse points: " + path);
+            }
+        }
+
+        internal static void AddFullControlRules(FileSystemSecurity security, bool inheritToChildren)
+        {
+            InheritanceFlags inheritance = inheritToChildren
+                ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit
+                : InheritanceFlags.None;
+            SecurityIdentifier currentUser = WindowsIdentity.GetCurrent().User;
+            if (currentUser != null)
+            {
+                security.AddAccessRule(new FileSystemAccessRule(currentUser, FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
+            }
+
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                FileSystemRights.FullControl,
+                inheritance,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+                FileSystemRights.FullControl,
+                inheritance,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+        }
+    }
+
+    internal static class CredentialStore
+    {
+        public static string Create(string sessionName, string password)
+        {
+            if (password == null)
+            {
+                return string.Empty;
+            }
+
+            SessionPaths.EnsureSecureSessionDirectory(sessionName);
+            string path = Path.Combine(SessionPaths.GetSessionDir(sessionName), "credential.secret");
+            WriteProtected(path, password, new UTF8Encoding(false));
+            return path;
+        }
+
+        public static void WriteProtected(string path, string content, Encoding encoding)
+        {
+            File.WriteAllText(path, content, encoding);
+            FileSecurity security = new FileSecurity();
+            security.SetAccessRuleProtection(true, false);
+            SessionPaths.AddFullControlRules(security, false);
+            File.SetAccessControl(path, security);
+        }
+
+        public static string Consume(string sessionName, string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return null;
+            }
+
+            string expectedPath = Path.GetFullPath(Path.Combine(SessionPaths.GetSessionDir(sessionName), "credential.secret"));
+            string fullPath = Path.GetFullPath(path);
+            if (!string.Equals(fullPath, expectedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("invalid credential file path");
+            }
+
+            try
+            {
+                return File.ReadAllText(fullPath, Encoding.UTF8);
+            }
+            finally
+            {
+                if (File.Exists(fullPath))
+                {
+                    File.Delete(fullPath);
+                }
+            }
+        }
+
+        public static void Delete(string path)
+        {
+            if (!string.IsNullOrEmpty(path) && File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+
+        public static string Read(string path)
+        {
+            return File.ReadAllText(path, Encoding.UTF8);
         }
     }
 
@@ -280,6 +426,7 @@ namespace TermWrap
         public string SessionName;
         public int DaemonPid;
         public int RemotePid;
+        public string RemoteStartedAtUtc;
         public string Protocol;
         public string Host;
         public int Port;
@@ -300,7 +447,33 @@ namespace TermWrap
 
             try
             {
-                return !Process.GetProcessById(DaemonPid).HasExited;
+                Process process = Process.GetProcessById(DaemonPid);
+                string expectedName = Path.GetFileNameWithoutExtension(Process.GetCurrentProcess().MainModule.FileName);
+                if (process.HasExited || !string.Equals(process.ProcessName, expectedName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                DateTime recordedStart;
+                if (!DateTime.TryParse(
+                    StartedAtUtc,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind,
+                    out recordedStart))
+                {
+                    return false;
+                }
+
+                // A PID can be reused long after a session daemon exits.  The
+                // metadata timestamp is captured in the daemon constructor,
+                // so allow a small startup margin but reject another process.
+                TimeSpan difference = process.StartTime.ToUniversalTime() - recordedStart.ToUniversalTime();
+                if (Math.Abs(difference.TotalSeconds) > 30)
+                {
+                    return false;
+                }
+
+                return true;
             }
             catch
             {
@@ -330,6 +503,7 @@ namespace TermWrap
                 string value = line.Substring(index + 1);
                 if (key == "daemonPid") { int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out info.DaemonPid); }
                 else if (key == "remotePid") { int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out info.RemotePid); }
+                else if (key == "remoteStartedAtUtc") { info.RemoteStartedAtUtc = value; }
                 else if (key == "protocol") { info.Protocol = value; }
                 else if (key == "host") { info.Host = value; }
                 else if (key == "port") { int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out info.Port); }
@@ -383,6 +557,7 @@ namespace TermWrap
         string ProtocolName { get; }
         string TargetDescription { get; }
         int RemotePid { get; }
+        string RemoteStartedAtUtc { get; }
         bool HasExited { get; }
         string DescribeState();
         Stream InputStream { get; }
@@ -401,6 +576,7 @@ namespace TermWrap
         private readonly string _sessionDir;
         private Process _process;
         private string _askPassScriptPath;
+        private string _askPassSecretPath;
 
         public SshSessionTransport(string sshPath, string sshArguments, string password, string sessionDir)
         {
@@ -413,6 +589,15 @@ namespace TermWrap
         public string ProtocolName { get { return "ssh"; } }
         public string TargetDescription { get { return _sshArguments; } }
         public int RemotePid { get { return _process == null ? 0 : _process.Id; } }
+        public string RemoteStartedAtUtc
+        {
+            get
+            {
+                return _process == null
+                    ? string.Empty
+                    : _process.StartTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+            }
+        }
         public bool HasExited { get { return _process == null || _process.HasExited; } }
         public string DescribeState()
         {
@@ -445,7 +630,7 @@ namespace TermWrap
                 RedirectStandardError = true
             };
 
-            if (!string.IsNullOrEmpty(_password))
+            if (_password != null)
             {
                 _askPassScriptPath = CreateAskPassScript();
                 startInfo.EnvironmentVariables["SSH_ASKPASS"] = _askPassScriptPath;
@@ -497,11 +682,13 @@ namespace TermWrap
         private string CreateAskPassScript()
         {
             string path = Path.Combine(_sessionDir, "askpass.cmd");
-            File.WriteAllText(
+            _askPassSecretPath = Path.Combine(_sessionDir, "askpass.secret");
+            CredentialStore.WriteProtected(_askPassSecretPath, _password, new UTF8Encoding(false));
+            string executablePath = Process.GetCurrentProcess().MainModule.FileName;
+            CredentialStore.WriteProtected(
                 path,
                 "@echo off" + Environment.NewLine +
-                "setlocal disableDelayedExpansion" + Environment.NewLine +
-                "echo " + EscapeForCmd(_password) + Environment.NewLine,
+                QuoteForBatch(executablePath) + " --askpass-secret " + QuoteForBatch(_askPassSecretPath) + Environment.NewLine,
                 Encoding.ASCII);
             return path;
         }
@@ -514,6 +701,8 @@ namespace TermWrap
                 {
                     File.Delete(_askPassScriptPath);
                 }
+
+                CredentialStore.Delete(_askPassSecretPath);
             }
             catch (Exception ex)
             {
@@ -521,21 +710,9 @@ namespace TermWrap
             }
         }
 
-        private static string EscapeForCmd(string value)
+        private static string QuoteForBatch(string value)
         {
-            StringBuilder builder = new StringBuilder(value.Length * 2);
-            for (int i = 0; i < value.Length; i++)
-            {
-                char c = value[i];
-                if (c == '^' || c == '&' || c == '|' || c == '<' || c == '>' || c == '(' || c == ')' || c == '%')
-                {
-                    builder.Append('^');
-                }
-
-                builder.Append(c);
-            }
-
-            return builder.ToString();
+            return "\"" + value.Replace("\"", "\"\"") + "\"";
         }
     }
 
@@ -555,6 +732,7 @@ namespace TermWrap
         private readonly TailBuffer _tailBuffer;
         private readonly TailBuffer _readBuffer;
         private readonly object _sync = new object();
+        private readonly object _metadataSync = new object();
         private readonly DateTime _startedAtUtc;
         private Mutex _mutex;
         private volatile bool _stopping;
@@ -589,7 +767,7 @@ namespace TermWrap
 
         public int Run()
         {
-            Directory.CreateDirectory(_sessionDir);
+            SessionPaths.EnsureSecureSessionDirectory(_sessionName);
             bool createdNew;
             _mutex = new Mutex(false, SessionPaths.GetMutexName(_sessionName), out createdNew);
             if (!_mutex.WaitOne(0))
@@ -741,11 +919,11 @@ namespace TermWrap
                     {
                         writer.NewLine = "\n";
                         string command = reader.ReadLine() ?? string.Empty;
-                        Logger.Info("command server request session={0} pipe={1} command={2}", _sessionName, pipeName, command);
+                        Logger.Info("command server request session={0} pipe={1} command={2}", _sessionName, pipeName, SummarizePipeMessage(command));
                         string response = HandleCommand(command);
                         writer.WriteLine(response);
                         writer.Flush();
-                        Logger.Info("command server response session={0} pipe={1} response={2}", _sessionName, pipeName, response);
+                        Logger.Info("command server response session={0} pipe={1} response={2}", _sessionName, pipeName, SummarizePipeMessage(response));
                     }
                 }
                 catch (Exception ex)
@@ -808,9 +986,36 @@ namespace TermWrap
             }
             catch (Exception ex)
             {
-                Logger.Error("command failed session=" + _sessionName + " command=" + command + " " + ex.Message);
+                Logger.Error("command failed session=" + _sessionName + " command=" + SummarizePipeMessage(command) + " " + ex.Message);
                 return "ERR " + ex.Message.Replace('\r', ' ').Replace('\n', ' ');
             }
+        }
+
+        private static string SummarizePipeMessage(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return string.Empty;
+            }
+
+            if (message.StartsWith("SEND_TEXT ", StringComparison.Ordinal) ||
+                message.StartsWith("SEND_HEX ", StringComparison.Ordinal))
+            {
+                int separator = message.IndexOf(' ');
+                return message.Substring(0, separator) + " payload=<redacted>";
+            }
+
+            if (message.StartsWith("OK READ ", StringComparison.Ordinal) ||
+                message.StartsWith("OK READ_CLEAR ", StringComparison.Ordinal) ||
+                message.StartsWith("OK TAIL ", StringComparison.Ordinal))
+            {
+                string[] parts = message.Split(new[] { ' ' }, 5);
+                return parts.Length >= 4
+                    ? string.Join(" ", parts, 0, 4) + " payload=<redacted>"
+                    : "OK buffer payload=<redacted>";
+            }
+
+            return message;
         }
 
         private string EncodeSnapshot(string kind, TailSnapshot snapshot)
@@ -874,7 +1079,7 @@ namespace TermWrap
 
         private void MaybeHandleTelnetAutoLogin(byte[] buffer, int count)
         {
-            if (string.IsNullOrEmpty(_userName) && string.IsNullOrEmpty(_password))
+            if (string.IsNullOrEmpty(_userName) && _password == null)
             {
                 return;
             }
@@ -898,7 +1103,7 @@ namespace TermWrap
                 normalized = _recentText.ToLowerInvariant();
             }
 
-            if (_promptStage <= 1 && !string.IsNullOrEmpty(_password) && normalized.Contains((_passwordPrompt ?? string.Empty).ToLowerInvariant()))
+            if (_promptStage <= 1 && _password != null && normalized.Contains((_passwordPrompt ?? string.Empty).ToLowerInvariant()))
             {
                 byte[] data = Encoding.ASCII.GetBytes(_password + "\r\n");
                 QueueWriteToTransport(data, 150);
@@ -907,7 +1112,7 @@ namespace TermWrap
                 return;
             }
 
-            if (!sentUsernameThisCall && _promptStage == 1 && !string.IsNullOrEmpty(_password) && count > 0)
+            if (!sentUsernameThisCall && _promptStage == 1 && _password != null && count > 0)
             {
                 byte[] data = Encoding.ASCII.GetBytes(_password + "\r\n");
                 QueueWriteToTransport(data, 250);
@@ -956,27 +1161,43 @@ namespace TermWrap
 
         private void WriteMetadata()
         {
-            File.WriteAllText(
-                _metaFile,
-                string.Join(
+            lock (_metadataSync)
+            {
+                string content = string.Join(
                     Environment.NewLine,
                     "version=current",
-                    "session=" + _sessionName,
+                    "session=" + CleanMetadataValue(_sessionName),
                     "daemonPid=" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture),
                     "remotePid=" + (_transport == null ? "0" : _transport.RemotePid.ToString(CultureInfo.InvariantCulture)),
-                    "protocol=" + _protocol,
-                    "host=" + _host,
-                    "port=" + ExtractPort(),
-                    "userName=" + _userName,
+                    "remoteStartedAtUtc=" + (_transport == null ? string.Empty : _transport.RemoteStartedAtUtc),
+                    "protocol=" + CleanMetadataValue(_protocol),
+                    "host=" + CleanMetadataValue(_host),
+                    "port=" + CleanMetadataValue(ExtractPort()),
+                    "userName=" + CleanMetadataValue(_userName),
                     "authMode=" + GetAuthMode(),
-                    "knownHostsFile=" + _sessionKnownHostsFile,
-                    "target=" + (_transport == null ? _transportArguments : _transport.TargetDescription),
+                    "knownHostsFile=" + CleanMetadataValue(_sessionKnownHostsFile),
+                    "target=" + CleanMetadataValue(_transport == null ? _transportArguments : _transport.TargetDescription),
                     "startedAtUtc=" + _startedAtUtc.ToString("o", CultureInfo.InvariantCulture),
                     "status=" + (_stopping ? "stopping" : (_transport != null && !_transport.HasExited ? "running" : "stopped")),
-                    "lastError=" + _lastError.Replace("\r", " ").Replace("\n", " "),
-                    "exitReason=" + _exitReason.Replace("\r", " ").Replace("\n", " "),
-                    "stderrTail=" + _stderrTail.Replace("\r", " ").Replace("\n", " ")),
-                Encoding.UTF8);
+                    "lastError=" + CleanMetadataValue(_lastError),
+                    "exitReason=" + CleanMetadataValue(_exitReason),
+                    "stderrTail=" + CleanMetadataValue(_stderrTail));
+                string tempFile = _metaFile + ".tmp";
+                File.WriteAllText(tempFile, content, Encoding.UTF8);
+                if (File.Exists(_metaFile))
+                {
+                    File.Replace(tempFile, _metaFile, null);
+                }
+                else
+                {
+                    File.Move(tempFile, _metaFile);
+                }
+            }
+        }
+
+        private static string CleanMetadataValue(string value)
+        {
+            return (value ?? string.Empty).Replace("\r", " ").Replace("\n", " ");
         }
 
         private void EnsureSessionKnownHostsFile()
@@ -1002,7 +1223,7 @@ namespace TermWrap
         {
             if (string.Equals(_protocol, "telnet", StringComparison.OrdinalIgnoreCase))
             {
-                if (!string.IsNullOrEmpty(_userName) || !string.IsNullOrEmpty(_password))
+                if (!string.IsNullOrEmpty(_userName) || _password != null)
                 {
                     return "telnet_prompt_auto";
                 }
@@ -1010,7 +1231,7 @@ namespace TermWrap
                 return "none";
             }
 
-            return string.IsNullOrEmpty(_password) ? "none" : "ssh_askpass";
+            return _password == null ? "none" : "ssh_askpass";
         }
 
         private string ExtractPort()
@@ -1039,18 +1260,20 @@ namespace TermWrap
                 return;
             }
 
-            TryKillTrackedProcess(info.DaemonPid, "termwrap");
+            string daemonName = Path.GetFileNameWithoutExtension(Process.GetCurrentProcess().MainModule.FileName);
+            TryKillTrackedProcess(info.DaemonPid, daemonName, info.StartedAtUtc);
             if (string.Equals(info.Protocol, "ssh", StringComparison.OrdinalIgnoreCase))
             {
-                TryKillTrackedProcess(info.RemotePid, "ssh");
+                TryKillTrackedProcess(info.RemotePid, "ssh", info.RemoteStartedAtUtc);
             }
 
             TryDeleteAskPassFile(info);
         }
 
-        private static void TryKillTrackedProcess(int pid, string expectedProcessName)
+        private static void TryKillTrackedProcess(int pid, string expectedProcessName, string expectedStartedAtUtc)
         {
-            if (pid <= 0)
+            DateTime expectedStart;
+            if (pid <= 0 || !DateTime.TryParse(expectedStartedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out expectedStart))
             {
                 return;
             }
@@ -1066,6 +1289,13 @@ namespace TermWrap
                 if (!string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase))
                 {
                     Logger.Info("clear-stale skipped pid={0} expected={1} actual={2}", pid.ToString(CultureInfo.InvariantCulture), expectedProcessName, process.ProcessName);
+                    return;
+                }
+
+                TimeSpan difference = process.StartTime.ToUniversalTime() - expectedStart.ToUniversalTime();
+                if (Math.Abs(difference.TotalSeconds) > 30)
+                {
+                    Logger.Info("clear-stale skipped pid={0} expectedStart={1} actualStart={2}", pid.ToString(CultureInfo.InvariantCulture), expectedStartedAtUtc, process.StartTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture));
                     return;
                 }
 

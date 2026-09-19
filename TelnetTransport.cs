@@ -23,6 +23,7 @@ namespace TermWrap
         public string ProtocolName { get { return "telnet"; } }
         public string TargetDescription { get { return _host + ":" + _port.ToString(); } }
         public int RemotePid { get { return 0; } }
+        public string RemoteStartedAtUtc { get { return string.Empty; } }
         public bool HasExited { get { return _inputStream != null && _inputStream.EndOfStream; } }
         public string DescribeState()
         {

@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -17,6 +18,30 @@ namespace TermWrap
 {
     internal static class Program
     {
+        private const int StdInputHandle = -10;
+        private const int StdOutputHandle = -11;
+        private const int StdErrorHandle = -12;
+        private const uint GenericRead = 0x80000000;
+        private const uint GenericWrite = 0x40000000;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareWrite = 0x00000002;
+        private const uint OpenExisting = 3;
+        private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetStdHandle(int handle, IntPtr value);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFile(
+            string fileName, uint access, uint share, IntPtr security, uint creation,
+            uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
         private const string AppVersion = "current";
         private const int TailPollIntervalMs = 2000;
         private const int StartReadyTimeoutMs = 8000;
@@ -27,26 +52,48 @@ namespace TermWrap
         private const int StopExitPollIntervalMs = 100;
         private static string _currentLogFolder;
         
-        private sealed class GlobalOptions
-        {
-            public string LogFolder;
-            public string[] RemainingArgs = new string[0];
-        }
-
         private static int Main(string[] args)
         {
-            Console.OutputEncoding = Encoding.UTF8;
-            GlobalOptions globalOptions = ParseGlobalOptions(args);
-            _currentLogFolder = globalOptions.LogFolder;
-            Logger.Initialize(AppVersion, globalOptions.LogFolder);
-            Logger.Info("process start args={0}", string.Join(" ", globalOptions.RemainingArgs));
-
-            if (globalOptions.RemainingArgs.Length > 0 && globalOptions.RemainingArgs[0] == "--daemon")
+            Console.OutputEncoding = new UTF8Encoding(false);
+            return RunWithLogging(delegate
             {
-                return RunWithLogging(delegate { return DaemonMain(globalOptions.RemainingArgs); });
+                if (args.Length == 2 && args[0] == "--askpass-secret")
+                {
+                    return PrintAskPassSecret(args[1]);
+                }
+
+                GlobalOptions globalOptions = CliOptions.ParseGlobal(args);
+                _currentLogFolder = globalOptions.LogFolder;
+                Logger.Initialize(AppVersion, globalOptions.LogFolder);
+                // Do not log user input, SSH suffixes, or passwords in argv.
+                Logger.Info("process start");
+                if (globalOptions.RemainingArgs.Length > 0 && globalOptions.RemainingArgs[0] == "--daemon")
+                {
+                    return DaemonMain(globalOptions.RemainingArgs);
+                }
+                return CliMain(globalOptions.RemainingArgs);
+            });
+        }
+
+        private static int PrintAskPassSecret(string path)
+        {
+            string fullPath = Path.GetFullPath(path);
+            string root = Path.GetFullPath(SessionPaths.SessionsRoot);
+            string rootPrefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!fullPath.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(Path.GetFileName(fullPath), "askpass.secret", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("invalid askpass secret path");
             }
 
-            return RunWithLogging(delegate { return CliMain(globalOptions.RemainingArgs); });
+            byte[] data = Encoding.UTF8.GetBytes(CredentialStore.Read(fullPath) + Environment.NewLine);
+            using (Stream output = Console.OpenStandardOutput())
+            {
+                output.Write(data, 0, data.Length);
+                output.Flush();
+            }
+
+            return 0;
         }
 
         private static int RunWithLogging(Func<int> action)
@@ -57,9 +104,8 @@ namespace TermWrap
             }
             catch (Exception ex)
             {
-                Logger.Error("fatal: " + ex);
-                Console.Error.WriteLine("error: " + ex.Message);
-                return 1;
+                try { Logger.Error("fatal: " + ex); } catch { }
+                return CliOutput.Error(ex);
             }
         }
 
@@ -67,33 +113,39 @@ namespace TermWrap
         {
             if (args.Length == 0)
             {
-                PrintUsage();
-                return 1;
+                throw CliException.Usage("a command is required; use termwrap help");
             }
 
             string command = args[0].ToLowerInvariant();
             if (command == "start") { return StartCommand(args); }
             if (command == "stop") { return StopCommand(args); }
+            if (command == "prune") { return PruneCommand(args); }
             if (command == "list") { return ListCommand(args); }
             if (command == "tail") { return TailCommand(args); }
             if (command == "read") { return ReadCommand(args); }
             if (command == "send") { return SendCommand(args); }
             if (command == "help" || command == "--help" || command == "-h")
             {
-                PrintUsage();
-                return 0;
+                return HelpCommand(args);
             }
 
-            throw new InvalidOperationException("unknown command: " + args[0]);
+            throw CliException.Usage("unknown command; use termwrap help");
         }
 
         private static int DaemonMain(string[] args)
         {
+            // A persistent daemon must not keep the caller's output pipe open.
+            // Diagnostics remain in metadata / the explicitly enabled debug log.
+            DetachDaemonStandardHandles();
+            Console.SetIn(TextReader.Null);
+            Console.SetOut(TextWriter.Null);
+            Console.SetError(TextWriter.Null);
             if (args.Length < 9)
             {
                 throw new InvalidOperationException("daemon arguments are incomplete");
             }
 
+            string password = CredentialStore.Consume(args[1], DecodeOrEmpty(args[7]));
             SessionDaemon daemon = new SessionDaemon(
                 args[1],
                 args[2],
@@ -101,9 +153,39 @@ namespace TermWrap
                 DecodeOrEmpty(args[4]),
                 DecodeOrEmpty(args[5]),
                 DecodeOrEmpty(args[6]),
-                DecodeOrEmpty(args[7]),
+                password,
                 DecodeOrEmpty(args[8]));
             return daemon.Run();
+        }
+
+        private static void DetachDaemonStandardHandles()
+        {
+            IntPtr oldInput = GetStdHandle(StdInputHandle);
+            IntPtr oldOutput = GetStdHandle(StdOutputHandle);
+            IntPtr oldError = GetStdHandle(StdErrorHandle);
+            IntPtr nulInput = CreateFile("NUL", GenericRead, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            IntPtr nulOutput = CreateFile("NUL", GenericWrite, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (nulInput == InvalidHandleValue || nulOutput == InvalidHandleValue)
+            {
+                if (nulInput != InvalidHandleValue) { CloseHandle(nulInput); }
+                if (nulOutput != InvalidHandleValue) { CloseHandle(nulOutput); }
+                return;
+            }
+
+            SetStdHandle(StdInputHandle, nulInput);
+            SetStdHandle(StdOutputHandle, nulOutput);
+            SetStdHandle(StdErrorHandle, nulOutput);
+            CloseInheritedHandle(oldInput, nulInput);
+            CloseInheritedHandle(oldOutput, nulOutput);
+            CloseInheritedHandle(oldError, nulOutput);
+        }
+
+        private static void CloseInheritedHandle(IntPtr handle, IntPtr replacement)
+        {
+            if (handle != IntPtr.Zero && handle != InvalidHandleValue && handle != replacement)
+            {
+                CloseHandle(handle);
+            }
         }
 
         private static int StartCommand(string[] args)
@@ -116,8 +198,10 @@ namespace TermWrap
             SessionInfo existing = SessionInfo.Load(options.SessionName);
             if (existing.IsAlive())
             {
-                throw new InvalidOperationException("session already running: " + options.SessionName);
+                throw CliException.Conflict("session already running: " + options.SessionName);
             }
+
+            CliOptions.ReadPassword(options);
 
             string executablePath;
             string transportArguments;
@@ -147,7 +231,10 @@ namespace TermWrap
             daemonParts.Add(EncodeOrEmpty(executablePath));
             daemonParts.Add(EncodeOrEmpty(transportArguments));
             daemonParts.Add(EncodeOrEmpty(options.UserName));
-            daemonParts.Add(EncodeOrEmpty(options.Password));
+            // Only a protected one-time file path is placed on the command line;
+            // the daemon consumes and deletes the credential immediately.
+            string credentialPath = CredentialStore.Create(options.SessionName, options.Password);
+            daemonParts.Add(EncodeOrEmpty(credentialPath));
             daemonParts.Add(EncodeOrEmpty(options.GetPromptConfig()));
             string daemonArgs = JoinList(daemonParts);
 
@@ -158,16 +245,27 @@ namespace TermWrap
                 options.Host,
                 options.Port.ToString(CultureInfo.InvariantCulture));
 
-            Process process = Process.Start(new ProcessStartInfo
+            ProcessStartInfo daemonStartInfo = new ProcessStartInfo
             {
                 FileName = exePath,
                 Arguments = daemonArgs,
-                UseShellExecute = false,
+                UseShellExecute = true,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
-            });
+            };
+            Process process;
+            try
+            {
+                process = Process.Start(daemonStartInfo);
+            }
+            catch
+            {
+                CredentialStore.Delete(credentialPath);
+                throw;
+            }
             if (process == null)
             {
+                CredentialStore.Delete(credentialPath);
                 throw new InvalidOperationException("failed to start daemon process");
             }
 
@@ -185,8 +283,9 @@ namespace TermWrap
                         throw new InvalidOperationException(BuildStartFailureMessage(options.SessionName, "ssh transport exited during startup stabilization"));
                     }
 
-                    Console.WriteLine("started " + options.SessionName);
-                    Console.WriteLine("warning: if this is being run from an AI sandbox, this start command is likely to fail after launch. Re-run only the start command with sandbox escalation.");
+                    CliOutput.Write(CliOutput.Result("start", "session", options.SessionName,
+                        "state", "running", "protocol", info.Protocol, "host", info.Host, "port", info.Port,
+                        "daemonPid", info.DaemonPid, "remotePid", info.RemotePid), "started " + options.SessionName);
                     return 0;
                 }
 
@@ -196,7 +295,7 @@ namespace TermWrap
                 }
             }
 
-            throw new InvalidOperationException(BuildStartFailureMessage(options.SessionName, "session did not become ready in time"));
+            throw CliException.Timeout(BuildStartFailureMessage(options.SessionName, "session did not become ready in time"));
         }
 
         private static bool IsCommandPipeReady(string sessionName)
@@ -311,112 +410,126 @@ namespace TermWrap
 
         private static int StopCommand(string[] args)
         {
-            StopOptions options = ParseStopOptions(args);
-            if (options.Prune && string.IsNullOrEmpty(options.SessionName))
+            StopOptions options = CliOptions.ParseStop(args, false);
+            if (!options.All && options.SessionName == null)
             {
-                return PruneAllSessions(options.ClearStale);
+                options.SessionName = ResolveTargetSessionFromRunningSessions();
             }
-
-            return StopSingleSession(options);
-        }
-
-        private static int StopSingleSession(StopOptions options)
-        {
-            bool sessionExists = SessionPaths.SessionDirectoryExists(options.SessionName);
-            SessionInfo info = SessionInfo.Load(options.SessionName);
-            if (!options.ClearStale)
+            string[] sessions = options.All ? SessionPaths.GetKnownSessions(true) : new[] { options.SessionName };
+            List<object> results = new List<object>();
+            List<string> messages = new List<string>();
+            foreach (string session in sessions)
             {
-                try
-                {
-                    SendSimpleCommand(options.SessionName, "STOP");
-                    // STOP is asynchronous; wait briefly so prune does not race a
-                    // daemon that is still unwinding its child process.
-                    WaitForSessionExit(options.SessionName, StopExitTimeoutMs);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    if (!ex.Message.StartsWith("session is not running:", StringComparison.Ordinal))
-                    {
-                        throw;
-                    }
-                }
+                StopSingleSession(session, options);
+                results.Add(CliOutput.Fields("session", session, "state", "stopped", "pruned", options.Prune));
+                messages.Add((options.Prune ? "stopped and pruned " : "stopped ") + session);
             }
-            else
-            {
-                if (info.IsAlive())
-                {
-                    try
-                    {
-                        SendSimpleCommand(options.SessionName, "STOP");
-                        WaitForSessionExit(options.SessionName, StopExitTimeoutMs);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Error("stop clear-stale graceful stop failed session=" + options.SessionName + " " + ex);
-                    }
-                }
-
-                SessionDaemon.ClearStaleProcesses(SessionInfo.Load(options.SessionName));
-                Console.WriteLine("cleared stale " + options.SessionName);
-            }
-
-            if (options.Prune)
-            {
-                Thread.Sleep(200);
-                SessionInfo refreshed = SessionInfo.Load(options.SessionName);
-                if (refreshed.IsAlive())
-                {
-                    throw new InvalidOperationException("cannot prune running session: " + options.SessionName);
-                }
-
-                if (!sessionExists)
-                {
-                    Console.WriteLine("no session data");
-                    return 0;
-                }
-
-                SessionPaths.DeleteSessionDirectory(options.SessionName);
-                Console.WriteLine("pruned " + options.SessionName);
-            }
-
+            object result = options.All
+                ? CliOutput.Result("stop", "sessions", results)
+                : CliOutput.Result("stop", "session", options.SessionName, "state", "stopped", "pruned", options.Prune);
+            CliOutput.Write(result, messages.Count == 0 ? "no sessions" : string.Join(Environment.NewLine, messages.ToArray()));
             return 0;
         }
 
-        private static void WaitForSessionExit(string sessionName, int timeoutMs)
+        private static void StopSingleSession(string sessionName, StopOptions options)
+        {
+            if (!SessionPaths.SessionDirectoryExists(sessionName))
+            {
+                throw CliException.NotFound("session not found: " + sessionName);
+            }
+            SessionInfo info = SessionInfo.Load(sessionName);
+            if (info.IsAlive())
+            {
+                try
+                {
+                    SendSimpleCommand(sessionName, "STOP");
+                    if (!WaitForSessionExit(sessionName, StopExitTimeoutMs))
+                    {
+                        throw CliException.Timeout("session did not stop in time: " + sessionName);
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                    if (!options.ClearStale) { throw; }
+                }
+                catch (IOException)
+                {
+                    if (!options.ClearStale) { throw; }
+                }
+            }
+            if (options.ClearStale)
+            {
+                SessionDaemon.ClearStaleProcesses(SessionInfo.Load(sessionName));
+                if (!WaitForSessionExit(sessionName, StopExitTimeoutMs))
+                {
+                    throw CliException.Timeout("session still running after --force: " + sessionName);
+                }
+            }
+            if (options.Prune) { PruneSingleSession(sessionName, true); }
+        }
+
+        private static bool WaitForSessionExit(string sessionName, int timeoutMs)
         {
             DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
             while (DateTime.UtcNow < deadline)
             {
-                if (!SessionInfo.Load(sessionName).IsAlive())
-                {
-                    return;
-                }
-
+                if (!SessionInfo.Load(sessionName).IsAlive()) { return true; }
                 Thread.Sleep(StopExitPollIntervalMs);
             }
-
-            Logger.Info("stop wait timed out session={0}", sessionName);
+            return false;
         }
 
-        private static int PruneAllSessions(bool clearStale)
+        private static int PruneCommand(string[] args)
         {
-            string[] sessions = SessionPaths.GetKnownSessions(true);
-            if (sessions.Length == 0)
+            StopOptions options = CliOptions.ParseStop(args, true);
+            if (options.SessionName == null)
             {
-                Console.WriteLine("no sessions");
-                return 0;
+                options.SessionName = ResolveUniqueSession(true);
             }
-
-            for (int i = 0; i < sessions.Length; i++)
-            {
-                StopOptions options = new StopOptions();
-                options.SessionName = sessions[i];
-                options.ClearStale = clearStale;
-                options.Prune = true;
-                StopSingleSession(options);
-            }
-
+            PruneSingleSession(options.SessionName, false);
+            object result = CliOutput.Result("prune", "session", options.SessionName, "pruned", true);
+            CliOutput.Write(result, "pruned " + options.SessionName);
             return 0;
+        }
+
+        private static void PruneSingleSession(string sessionName, bool waitForStop)
+        {
+            // The daemon owns this mutex during startup and shutdown as well.
+            // Metadata alone must not authorize deletion while a daemon is active.
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(waitForStop ? StopExitTimeoutMs : 0);
+            while (true)
+            {
+                using (Mutex mutex = new Mutex(false, SessionPaths.GetMutexName(sessionName)))
+                {
+                    bool acquired = false;
+                    try
+                    {
+                        try { acquired = mutex.WaitOne(0); }
+                        catch (AbandonedMutexException) { acquired = true; }
+                        if (acquired && !SessionInfo.Load(sessionName).IsAlive())
+                        {
+                            if (!SessionPaths.SessionDirectoryExists(sessionName))
+                            {
+                                throw CliException.NotFound("session not found: " + sessionName);
+                            }
+                            SessionPaths.DeleteSessionDirectory(sessionName);
+                            return;
+                        }
+
+                    }
+                    finally
+                    {
+                        if (acquired) { mutex.ReleaseMutex(); }
+                    }
+
+                    if (waitForStop && DateTime.UtcNow < deadline)
+                    {
+                        Thread.Sleep(50);
+                        continue;
+                    }
+                    throw CliException.Conflict("cannot prune active session: " + sessionName + "; stop it first");
+                }
+            }
         }
 
         private static int ListCommand(string[] args)
@@ -427,61 +540,30 @@ namespace TermWrap
             {
                 if (args[i] == "--all" || args[i] == "-a") { showAll = true; continue; }
                 if (args[i] == "--verbose" || args[i] == "-v") { verbose = true; continue; }
-                throw new InvalidOperationException("usage: list [--all] [--verbose]");
+                throw CliException.Usage("usage: list [--all] [--verbose] [--json]");
             }
-
-            Directory.CreateDirectory(SessionPaths.SessionsRoot);
-            string[] dirs = Directory.GetDirectories(SessionPaths.SessionsRoot);
-            if (dirs.Length == 0)
+            List<object> records = new List<object>();
+            List<string> lines = new List<string>();
+            foreach (string name in SessionPaths.GetKnownSessions(true))
             {
-                Console.WriteLine("no sessions");
-                return 0;
-            }
-
-            int shown = 0;
-            foreach (string dir in dirs)
-            {
-                string sessionName = Path.GetFileName(dir);
-                SessionInfo info = SessionInfo.Load(sessionName);
+                SessionInfo info = SessionInfo.Load(name);
                 bool alive = info.IsAlive();
-                if (!showAll && !alive)
-                {
-                    continue;
-                }
-
-                if (verbose)
-                {
-                    Console.WriteLine(
+                if (!showAll && !alive) { continue; }
+                records.Add(CliOutput.Fields("session", name, "state", alive ? "running" : "stopped",
+                    "daemonPid", info.DaemonPid, "remotePid", info.RemotePid,
+                    "protocol", info.Protocol, "host", info.Host, "port", info.Port,
+                    "startedAtUtc", info.StartedAtUtc, "authMode", info.AuthMode));
+                lines.Add(verbose
+                    ? string.Format(CultureInfo.InvariantCulture,
                         "{0}\t{1}\tpid={2}\tremotePid={3}\tprotocol={4}\thost={5}\tport={6}\tstarted={7}\tauth={8}\ttarget={9}",
-                        sessionName,
-                        alive ? "running" : "stopped",
-                        info.DaemonPid,
-                        info.RemotePid,
-                        EmptyDash(info.Protocol),
-                        EmptyDash(info.Host),
-                        info.Port <= 0 ? "-" : info.Port.ToString(CultureInfo.InvariantCulture),
-                        EmptyDash(info.StartedAtUtc),
-                        EmptyDash(info.AuthMode),
-                        EmptyDash(info.Target));
-                }
-                else
-                {
-                    Console.WriteLine(
-                        "{0}\t{1}\t{2}\t{3}:{4}",
-                        sessionName,
-                        alive ? "running" : "stopped",
-                        EmptyDash(info.Protocol),
-                        EmptyDash(info.Host),
-                        info.Port <= 0 ? "-" : info.Port.ToString(CultureInfo.InvariantCulture));
-                }
-                shown++;
+                        name, alive ? "running" : "stopped", info.DaemonPid, info.RemotePid,
+                        EmptyDash(info.Protocol), EmptyDash(info.Host), info.Port, EmptyDash(info.StartedAtUtc),
+                        EmptyDash(info.AuthMode), EmptyDash(info.Target))
+                    : string.Format(CultureInfo.InvariantCulture, "{0}\t{1}\t{2}\t{3}:{4}",
+                        name, alive ? "running" : "stopped", EmptyDash(info.Protocol), EmptyDash(info.Host), info.Port));
             }
-
-            if (shown == 0)
-            {
-                Console.WriteLine("no sessions");
-            }
-
+            CliOutput.Write(CliOutput.Result("list", "sessions", records),
+                lines.Count == 0 ? "no sessions" : string.Join(Environment.NewLine, lines.ToArray()));
             return 0;
         }
 
@@ -489,96 +571,73 @@ namespace TermWrap
         {
             SessionCommandOptions options = ParseSessionCommandOptions(args, "tail");
             string sessionName = ResolveTailSession(options);
-            Console.WriteLine("tailing " + sessionName + "  source: memory-buffer  stop: Ctrl+C  interval: 2s");
+            RequireRunningSession(sessionName);
+            if (!CliOutput.Json) { CliOutput.Diagnostic("tailing " + sessionName + "  stop: Ctrl+C  interval: 2s"); }
             long nextOffset = -1;
             while (true)
             {
                 TailSnapshot snapshot;
-                try
+                try { snapshot = ReadTailSnapshot(sessionName, nextOffset); }
+                catch (Exception)
                 {
-                    snapshot = ReadTailSnapshot(sessionName, nextOffset);
+                    if (!SessionInfo.Load(sessionName).IsAlive()) { break; }
+                    throw;
                 }
-                catch (Exception ex)
-                {
-                    if (!SessionInfo.Load(sessionName).IsAlive())
-                    {
-                        return 0;
-                    }
-
-                    throw new InvalidOperationException("tail failed: " + ex.Message, ex);
-                }
-
-                if (snapshot.Data.Length > 0)
-                {
-                    Console.Write(Encoding.UTF8.GetString(snapshot.Data));
-                }
-
+                if (snapshot.Data.Length > 0) { WriteSnapshot("tail", sessionName, snapshot, false); }
                 nextOffset = snapshot.EndOffset;
-                if (!SessionInfo.Load(sessionName).IsAlive())
-                {
-                    return 0;
-                }
-
+                if (!SessionInfo.Load(sessionName).IsAlive()) { break; }
                 Thread.Sleep(TailPollIntervalMs);
             }
+            CliOutput.Write(CliOutput.Result("tail", "session", sessionName, "event", "stopped"), null);
+            return 0;
         }
 
         private static int ReadCommand(string[] args)
         {
             SessionCommandOptions options = ParseSessionCommandOptions(args, "read");
+            RequireRunningSession(options.SessionName);
             TailSnapshot snapshot = ReadBufferSnapshot(options.SessionName, options.Clear);
-            if (snapshot.Data.Length > 0)
-            {
-                Console.Write(Encoding.UTF8.GetString(snapshot.Data));
-            }
-
+            WriteSnapshot("read", options.SessionName, snapshot, options.Clear);
             return 0;
+        }
+
+        private static void WriteSnapshot(string command, string session, TailSnapshot snapshot, bool cleared)
+        {
+            string text = Encoding.UTF8.GetString(snapshot.Data);
+            if (!CliOutput.Json) { Console.Write(text); return; }
+            CliOutput.Write(CliOutput.Result(command, "session", session, "event", "data",
+                "startOffset", snapshot.StartOffset, "endOffset", snapshot.EndOffset,
+                "text", text, "dataBase64", Convert.ToBase64String(snapshot.Data), "cleared", cleared), null);
         }
 
         private static int SendCommand(string[] args)
         {
             SessionCommandOptions options = ParseSessionCommandOptions(args, "send");
-            string command = null;
-
-            if (!string.IsNullOrEmpty(options.TextValue))
+            string command;
+            string mode;
+            if (options.LineValue != null)
+            {
+                // Use the existing raw-input operation, in one request, so older
+                // running daemons also support --line without interleaved input.
+                command = "SEND_TEXT " + Convert.ToBase64String(Encoding.UTF8.GetBytes(options.LineValue + "\r"));
+                mode = "line";
+            }
+            else if (options.TextValue != null)
             {
                 command = "SEND_TEXT " + Convert.ToBase64String(Encoding.UTF8.GetBytes(options.TextValue));
+                mode = "text";
             }
-            else if (!string.IsNullOrEmpty(options.HexValue))
-            {
-                command = "SEND_HEX " + options.HexValue;
-            }
-            else if (!string.IsNullOrEmpty(options.ControlValue))
-            {
-                command = "SEND_CONTROL " + options.ControlValue;
-            }
-
-            if (string.IsNullOrEmpty(command))
-            {
-                throw new InvalidOperationException("usage: send [--session SESSION] (--text TEXT | --hex HEX | --control CONTROL)");
-            }
-
-            return SendSimpleCommand(options.SessionName, command);
+            else if (options.HexValue != null) { command = "SEND_HEX " + options.HexValue; mode = "hex"; }
+            else { command = "SEND_CONTROL " + options.ControlValue; mode = "key"; }
+            SendSimpleCommand(options.SessionName, command);
+            CliOutput.Write(CliOutput.Result("send", "session", options.SessionName, "mode", mode, "sent", true), "sent " + mode);
+            return 0;
         }
 
-        private static int SendSimpleCommand(string sessionName, string command)
+        private static void SendSimpleCommand(string sessionName, string command)
         {
-            SessionInfo info = SessionInfo.Load(sessionName);
-            if (!info.IsAlive())
-            {
-                if (string.Equals(command, "STOP", StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine("already stopped");
-                    return 0;
-                }
-
-                throw new InvalidOperationException("session is not running: " + sessionName);
-            }
-
-            string response = SendCommandAndReadResponse(sessionName, command);
-            EnsureOk(response);
-            Console.WriteLine(response.Substring(3).Trim());
-            return 0;
+            RequireRunningSession(sessionName);
+            EnsureOk(SendCommandAndReadResponse(sessionName, command));
         }
 
         private static TailSnapshot ReadTailSnapshot(string sessionName, long offset)
@@ -627,7 +686,7 @@ namespace TermWrap
                     "pipe client connect begin session={0} pipe={1} command={2} identity={3}",
                     sessionName,
                     pipeName,
-                    command,
+                    SummarizePipeMessage(command),
                     GetCurrentIdentityForLog());
                 using (NamedPipeClientStream pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut))
                 {
@@ -640,24 +699,24 @@ namespace TermWrap
                         writer.WriteLine(command);
                         writer.Flush();
                         string response = reader.ReadLine() ?? "ERR empty response";
-                        Logger.Info("pipe client response session={0} pipe={1} response={2}", sessionName, pipeName, response);
+                        Logger.Info("pipe client response session={0} pipe={1} response={2}", sessionName, pipeName, SummarizePipeMessage(response));
                         return response;
                     }
                 }
             }
             catch (TimeoutException)
             {
-                Logger.Error("pipe client timeout session=" + sessionName + " pipe=" + pipeName + " command=" + command);
-                throw new InvalidOperationException("session command pipe timed out: " + sessionName);
+                Logger.Error("pipe client timeout session=" + sessionName + " pipe=" + pipeName + " command=" + SummarizePipeMessage(command));
+                throw CliException.Timeout("session command pipe timed out: " + sessionName);
             }
             catch (UnauthorizedAccessException ex)
             {
-                Logger.Error("pipe client unauthorized session=" + sessionName + " pipe=" + pipeName + " command=" + command + " identity=" + GetCurrentIdentityForLog() + " " + ex.Message);
+                Logger.Error("pipe client unauthorized session=" + sessionName + " pipe=" + pipeName + " command=" + SummarizePipeMessage(command) + " identity=" + GetCurrentIdentityForLog() + " " + ex.Message);
                 throw;
             }
             catch (IOException ex)
             {
-                Logger.Error("pipe client io session=" + sessionName + " pipe=" + pipeName + " command=" + command + " " + ex.Message);
+                Logger.Error("pipe client io session=" + sessionName + " pipe=" + pipeName + " command=" + SummarizePipeMessage(command) + " " + ex.Message);
                 throw new InvalidOperationException("session command pipe failed: " + sessionName + " " + ex.Message);
             }
         }
@@ -671,7 +730,7 @@ namespace TermWrap
                     return options.SessionName;
                 }
 
-                Console.WriteLine("waiting for session " + options.SessionName);
+                CliOutput.Write(CliOutput.Result("tail", "session", options.SessionName, "event", "waiting"), "waiting for session " + options.SessionName);
                 while (true)
                 {
                     if (SessionInfo.Load(options.SessionName).IsAlive())
@@ -688,7 +747,7 @@ namespace TermWrap
                 return ResolveTargetSessionFromRunningSessions();
             }
 
-            Console.WriteLine("waiting for a running session");
+            CliOutput.Write(CliOutput.Result("tail", "session", null, "event", "waiting"), "waiting for a running session");
             while (true)
             {
                 string[] sessions = SessionPaths.GetKnownSessions(false);
@@ -699,11 +758,38 @@ namespace TermWrap
 
                 if (sessions.Length > 1)
                 {
-                    throw new InvalidOperationException("multiple running sessions; specify --session");
+                    throw CliException.Ambiguous("multiple running sessions; specify --session");
                 }
 
                 Thread.Sleep(TailPollIntervalMs);
             }
+        }
+
+        private static string SummarizePipeMessage(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return string.Empty;
+            }
+
+            if (message.StartsWith("SEND_TEXT ", StringComparison.Ordinal) ||
+                message.StartsWith("SEND_HEX ", StringComparison.Ordinal))
+            {
+                int separator = message.IndexOf(' ');
+                return message.Substring(0, separator) + " payload=<redacted>";
+            }
+
+            if (message.StartsWith("OK READ ", StringComparison.Ordinal) ||
+                message.StartsWith("OK READ_CLEAR ", StringComparison.Ordinal) ||
+                message.StartsWith("OK TAIL ", StringComparison.Ordinal))
+            {
+                string[] parts = message.Split(new[] { ' ' }, 5);
+                return parts.Length >= 4
+                    ? string.Join(" ", parts, 0, 4) + " payload=<redacted>"
+                    : "OK buffer payload=<redacted>";
+            }
+
+            return message;
         }
 
         private static string GetCurrentIdentityForLog()
@@ -733,38 +819,6 @@ namespace TermWrap
             }
         }
 
-        private static GlobalOptions ParseGlobalOptions(string[] args)
-        {
-            GlobalOptions options = new GlobalOptions();
-            List<string> remaining = new List<string>();
-            int index = 0;
-            // Treat only the leading options as global so later command arguments
-            // can freely contain strings such as "--log-folder".
-            while (index < args.Length)
-            {
-                if (args[index] == "--log-folder")
-                {
-                    if (index + 1 >= args.Length)
-                    {
-                        throw new InvalidOperationException("--log-folder requires a value");
-                    }
-
-                    options.LogFolder = args[index + 1];
-                    index += 2;
-                    continue;
-                }
-
-                break;
-            }
-
-            for (int i = index; i < args.Length; i++)
-            {
-                remaining.Add(args[i]);
-            }
-
-            options.RemainingArgs = remaining.ToArray();
-            return options;
-        }
 
         private static string GenerateSessionName(ConnectionProtocol protocol)
         {
@@ -783,105 +837,7 @@ namespace TermWrap
 
         private static StartOptions ParseStartOptions(string[] args)
         {
-            if (args.Length < 2)
-            {
-                throw new InvalidOperationException("usage: start [--session SESSION] --host HOST [--protocol ssh|telnet] [--port PORT] [--user USER] [--password PASSWORD] [--login-prompt TEXT] [--password-prompt TEXT] [--legacy-ssh] [--wait-ready] [ssh-args...]");
-            }
-
-            StartOptions options = new StartOptions();
-            int index = 1;
-
-            while (index < args.Length && args[index].StartsWith("-", StringComparison.Ordinal))
-            {
-                string option = args[index];
-                if (option == "--protocol") { options.Protocol = ParseProtocol(ReadOptionValue(args, ref index, option)); continue; }
-                if (option == "--host") { options.Host = ReadOptionValue(args, ref index, option); continue; }
-                if (option == "--user") { options.UserName = ReadOptionValue(args, ref index, option); continue; }
-                if (option == "--password") { options.Password = ReadOptionValue(args, ref index, option); continue; }
-                if (option == "--session") { options.SessionName = ReadOptionValue(args, ref index, option); continue; }
-                if (option == "--port") { options.Port = int.Parse(ReadOptionValue(args, ref index, option), CultureInfo.InvariantCulture); continue; }
-                if (option == "--login-prompt") { options.LoginPrompt = ReadOptionValue(args, ref index, option); continue; }
-                if (option == "--password-prompt") { options.PasswordPrompt = ReadOptionValue(args, ref index, option); continue; }
-                if (option == "--legacy-ssh") { options.EnableLegacySsh = true; index++; continue; }
-                if (option == "--wait-ready") { options.WaitReady = true; index++; continue; }
-                break;
-            }
-
-            if (string.IsNullOrEmpty(options.Host))
-            {
-                throw new InvalidOperationException("--host is required");
-            }
-
-            List<string> extras = new List<string>();
-            while (index < args.Length)
-            {
-                extras.Add(args[index]);
-                index++;
-            }
-
-            options.ExtraArgs = extras.ToArray();
-            if (options.Protocol == ConnectionProtocol.Telnet && options.Port <= 0)
-            {
-                options.Port = 23;
-            }
-
-            if (options.Protocol == ConnectionProtocol.Ssh && options.Port <= 0)
-            {
-                options.Port = 22;
-            }
-
-            if (options.Protocol == ConnectionProtocol.Ssh && options.EnableLegacySsh)
-            {
-                List<string> legacyExtras = new List<string>();
-                legacyExtras.Add("-o");
-                legacyExtras.Add("HostKeyAlgorithms=+ssh-rsa");
-                legacyExtras.Add("-o");
-                legacyExtras.Add("PubkeyAcceptedAlgorithms=+ssh-rsa");
-                legacyExtras.Add("-o");
-                legacyExtras.Add("MACs=hmac-sha1");
-                legacyExtras.AddRange(options.ExtraArgs);
-                options.ExtraArgs = legacyExtras.ToArray();
-            }
-
-            if (options.Protocol == ConnectionProtocol.Ssh && options.Port > 0 && !ContainsPortOption(options.ExtraArgs) && options.Port != 22)
-            {
-                List<string> sshExtras = new List<string>();
-                sshExtras.Add("-p");
-                sshExtras.Add(options.Port.ToString(CultureInfo.InvariantCulture));
-                sshExtras.AddRange(options.ExtraArgs);
-                options.ExtraArgs = sshExtras.ToArray();
-            }
-
-            return options;
-        }
-
-        private static bool ContainsPortOption(string[] args)
-        {
-            for (int i = 0; i < args.Length; i++)
-            {
-                if (args[i] == "-p") { return true; }
-            }
-            return false;
-        }
-
-        private static ConnectionProtocol ParseProtocol(string value)
-        {
-            if (string.Equals(value, "ssh", StringComparison.OrdinalIgnoreCase)) { return ConnectionProtocol.Ssh; }
-            if (string.Equals(value, "telnet", StringComparison.OrdinalIgnoreCase)) { return ConnectionProtocol.Telnet; }
-            throw new InvalidOperationException("unsupported protocol: " + value);
-        }
-
-        private static string ReadOptionValue(string[] args, ref int index, string option)
-        {
-            index++;
-            if (index >= args.Length)
-            {
-                throw new InvalidOperationException(option + " requires a value");
-            }
-
-            string value = args[index];
-            index++;
-            return value;
+            return CliOptions.ParseStart(args);
         }
 
         private static string BuildSshArguments(StartOptions options)
@@ -898,7 +854,6 @@ namespace TermWrap
                 parts.Add("-tt");
             }
 
-            parts.Add(options.Host);
             for (int i = 0; i < options.ExtraArgs.Length; i++)
             {
                 parts.Add(options.ExtraArgs[i]);
@@ -922,44 +877,10 @@ namespace TermWrap
                 parts.Add("GlobalKnownHostsFile=" + SessionPaths.GetWindowsSharedKnownHostsFile());
             }
 
+            parts.Add(options.Host);
             return JoinList(parts);
         }
 
-        private static StopOptions ParseStopOptions(string[] args)
-        {
-            StopOptions options = new StopOptions();
-            for (int i = 1; i < args.Length; i++)
-            {
-                string value = args[i];
-                if (value == "--session")
-                {
-                    options.SessionName = ReadOptionValue(args, ref i, value);
-                    i--;
-                    continue;
-                }
-
-                if (value == "--clear-stale")
-                {
-                    options.ClearStale = true;
-                    continue;
-                }
-
-                if (value == "--prune")
-                {
-                    options.Prune = true;
-                    continue;
-                }
-
-                throw new InvalidOperationException("usage: stop [--session SESSION] [--clear-stale] [--prune]");
-            }
-
-            if (string.IsNullOrEmpty(options.SessionName) && !options.Prune)
-            {
-                options.SessionName = ResolveTargetSessionFromRunningSessions();
-            }
-
-            return options;
-        }
 
         private static bool HasSshOption(string[] args, string optionName)
         {
@@ -990,98 +911,33 @@ namespace TermWrap
 
         private static SessionCommandOptions ParseSessionCommandOptions(string[] args, string commandName)
         {
-            SessionCommandOptions options = new SessionCommandOptions();
-
-            for (int i = 1; i < args.Length; i++)
-            {
-                string value = args[i];
-                if (value == "--session")
-                {
-                    options.SessionName = ReadOptionValue(args, ref i, value);
-                    i--;
-                    continue;
-                }
-
-                if (commandName == "read" && value == "--clear")
-                {
-                    options.Clear = true;
-                    continue;
-                }
-
-                if (commandName == "tail" && value == "--wait")
-                {
-                    options.Wait = true;
-                    continue;
-                }
-
-                if (commandName == "send" && value == "--text")
-                {
-                    options.TextValue = ReadOptionValue(args, ref i, value);
-                    i--;
-                    continue;
-                }
-
-                if (commandName == "send" && value == "--hex")
-                {
-                    options.HexValue = ReadOptionValue(args, ref i, value);
-                    i--;
-                    continue;
-                }
-
-                if (commandName == "send" && value == "--control")
-                {
-                    options.ControlValue = ReadOptionValue(args, ref i, value);
-                    i--;
-                    continue;
-                }
-
-                if (commandName == "tail")
-                {
-                    throw new InvalidOperationException("usage: tail [--session SESSION] [--wait]");
-                }
-
-                if (commandName == "read")
-                {
-                    throw new InvalidOperationException("usage: read [--session SESSION] [--clear]");
-                }
-
-                throw new InvalidOperationException("usage: send [--session SESSION] (--text TEXT | --hex HEX | --control CONTROL)");
-            }
-
-            if (string.IsNullOrEmpty(options.SessionName) && commandName != "tail")
+            SessionCommandOptions options = CliOptions.ParseSession(args, commandName);
+            if (options.SessionName == null && commandName != "tail")
             {
                 options.SessionName = ResolveTargetSessionFromRunningSessions();
             }
-
-            if (commandName == "send")
-            {
-                int specifiedValueCount = 0;
-                if (!string.IsNullOrEmpty(options.TextValue)) { specifiedValueCount++; }
-                if (!string.IsNullOrEmpty(options.HexValue)) { specifiedValueCount++; }
-                if (!string.IsNullOrEmpty(options.ControlValue)) { specifiedValueCount++; }
-                if (specifiedValueCount != 1)
-                {
-                    throw new InvalidOperationException("usage: send [--session SESSION] (--text TEXT | --hex HEX | --control CONTROL)");
-                }
-            }
-
             return options;
         }
 
         private static string ResolveTargetSessionFromRunningSessions()
         {
-            string[] sessions = SessionPaths.GetKnownSessions(false);
-            if (sessions.Length == 1)
-            {
-                return sessions[0];
-            }
+            return ResolveUniqueSession(false);
+        }
 
-            if (sessions.Length == 0)
-            {
-                throw new InvalidOperationException("no running session; specify --session");
-            }
+        private static string ResolveUniqueSession(bool includeStopped)
+        {
+            string[] sessions = SessionPaths.GetKnownSessions(includeStopped);
+            if (sessions.Length == 1) { return sessions[0]; }
+            if (sessions.Length == 0) { throw CliException.NotFound("no eligible session; specify --session"); }
+            throw CliException.Ambiguous("multiple sessions; specify --session (stop also accepts --all)");
+        }
 
-            throw new InvalidOperationException("multiple running sessions; specify --session");
+        private static void RequireRunningSession(string sessionName)
+        {
+            if (!SessionInfo.Load(sessionName).IsAlive())
+            {
+                throw CliException.NotFound("session is not running: " + sessionName);
+            }
         }
 
         private static string ResolveSshPath()
@@ -1179,55 +1035,89 @@ namespace TermWrap
             return string.IsNullOrEmpty(value) ? "-" : value;
         }
 
-        private static void PrintUsage()
+        private static int HelpCommand(string[] args)
         {
-            Console.WriteLine("termwrap.exe [--log-folder PATH] <command> [options]");
-            Console.WriteLine();
-            Console.WriteLine("Start a session");
-            Console.WriteLine("  termwrap.exe [--log-folder PATH] start [--session SESSION] --host HOST [--protocol ssh|telnet] [--port PORT] [--user USER] [--password PASSWORD] [--login-prompt TEXT] [--password-prompt TEXT] [--legacy-ssh] [--wait-ready] [ssh-args...]");
-            Console.WriteLine("  --session     optional; auto-generates ssh-001 / telnet-001 when omitted");
-            Console.WriteLine("  --host        target host or IP");
-            Console.WriteLine("  --protocol    default: ssh");
-            Console.WriteLine("  --port        default: ssh=22, telnet=23");
-            Console.WriteLine("  --legacy-ssh  add ssh-rsa / hmac-sha1 compatibility options");
-            Console.WriteLine("  --wait-ready  wait for the first shell prompt before returning");
-            Console.WriteLine("  --log-folder  optional; write termwrap.log only when specified");
-            Console.WriteLine("  note          if an AI sandbox causes start to fail after launch, rerun only start with sandbox escalation");
-            Console.WriteLine();
-            Console.WriteLine("Read session output");
-            Console.WriteLine("  termwrap.exe read [--session SESSION] [--clear]");
-            Console.WriteLine("  --clear       clear buffered output after reading");
-            Console.WriteLine();
-            Console.WriteLine("Follow session output");
-            Console.WriteLine("  termwrap.exe tail [--session SESSION] [--wait]");
-            Console.WriteLine("  --wait        wait until the target session appears");
-            Console.WriteLine();
-            Console.WriteLine("Send input");
-            Console.WriteLine("  termwrap.exe send [--session SESSION] --text TEXT");
-            Console.WriteLine("  termwrap.exe send [--session SESSION] --hex HEX");
-            Console.WriteLine("  termwrap.exe send [--session SESSION] --control <ctrl-c|ctrl-d|ctrl-z|esc|tab|enter|up|down|left|right|backspace>");
-            Console.WriteLine("  note          --text sends only the text itself; press Enter separately with --control enter");
-            Console.WriteLine();
-            Console.WriteLine("Stop and clean up");
-            Console.WriteLine("  termwrap.exe stop [--session SESSION] [--clear-stale] [--prune]");
-            Console.WriteLine("  --clear-stale force cleanup of stale processes");
-            Console.WriteLine("  --prune       delete session data after stop");
-            Console.WriteLine();
-            Console.WriteLine("List sessions");
-            Console.WriteLine("  termwrap.exe list [--all] [--verbose]");
-            Console.WriteLine();
-            Console.WriteLine("Session selection");
-            Console.WriteLine("  read / tail / send / stop can omit --session when exactly one running session exists");
-            Console.WriteLine("  start auto-generates a short session name when --session is omitted");
-            Console.WriteLine();
-            Console.WriteLine("Examples");
-            Console.WriteLine("  termwrap.exe start --session ssh-001 --host HOST --user USER --password PASSWORD --wait-ready");
-            Console.WriteLine("  termwrap.exe start --session telnet-001 --host HOST --protocol telnet --port 23 --user USER --password PASSWORD --wait-ready");
-            Console.WriteLine("  termwrap.exe --log-folder LOGS start --host HOST --user USER --password PASSWORD");
-            Console.WriteLine("  termwrap.exe send --text \"uname -a\"");
-            Console.WriteLine("  termwrap.exe send --control enter");
-            Console.WriteLine("  termwrap.exe read --clear");
-            Console.WriteLine("  termwrap.exe stop --prune");
+            if (args.Length > 2) { throw CliException.Usage("usage: help [command]"); }
+            string topic = args.Length == 2 ? args[1].ToLowerInvariant() : "";
+            string text;
+            switch (topic)
+            {
+                case "":
+                case "help":
+                    text = "termwrap [--json] [--log-folder PATH] <command> [options]\n\n" +
+                        "  start --host HOST [-s SESSION] [connection options] [-- SSH-ARGS...]\n" +
+                        "  list [--all] [--verbose]\n" +
+                        "  send [-s SESSION] (--text TEXT | --line TEXT | --hex HEX | --key KEY)\n" +
+                        "  read [-s SESSION] [--clear]\n" +
+                        "  tail [-s SESSION] [--wait]\n" +
+                        "  stop [-s SESSION | --all] [--force] [--prune]\n" +
+                        "  prune [-s SESSION]\n" +
+                        "  help [command]\n\n" +
+                        "Global options work before or after the command (not inside a value or after --).\n" +
+                        "-s is an alias for --session. Omission requires exactly one eligible session.\n" +
+                        "stop --all stops all sessions but never deletes their data. Deletion is one session at a time.\n" +
+                        "--json emits JSON; tail emits one JSON event per line. Errors go to stderr.\n" +
+                        "Exit codes: 0 success, 1 failure, 2 usage, 3 not_found, 4 ambiguous, 5 timeout, 6 conflict.";
+                    break;
+                case "start":
+                    text = "termwrap start --host HOST [-s SESSION] [options] [-- SSH-ARGS...]\n\n" +
+                        "  --protocol ssh|telnet    Default: ssh\n" +
+                        "  --port PORT             Default: 22 for SSH, 23 for Telnet\n" +
+                        "  --user USER\n" +
+                        "  --ask-password          Read without echo from the console\n" +
+                        "  --password-stdin        Read one UTF-8 line from stdin (no trimming)\n" +
+                        "  --password PASSWORD     Compatibility option; visible in caller arguments/history\n" +
+                        "  --login-prompt TEXT     Telnet prompt (default: login:)\n" +
+                        "  --password-prompt TEXT  Telnet prompt (default: password:)\n" +
+                        "  --legacy-ssh            Enable legacy SSH algorithms\n" +
+                        "  --wait-ready            Also wait for the existing prompt heuristic (8s deadline)\n\n" +
+                        "Choose only one password input method. A session name is generated when omitted.\n" +
+                        "SSH arguments require --, e.g.: start --host HOST -- -o ConnectTimeout=10";
+                    break;
+                case "send":
+                    text = "termwrap send [-s SESSION] (--text TEXT | --line TEXT | --hex HEX | --key KEY)\n\n" +
+                        "--text sends exact UTF-8 text, without Enter (empty text is allowed).\n" +
+                        "--line sends one UTF-8 line followed by one CR in a single request.\n" +
+                        "       Embedded CR/LF is rejected; an empty line sends only Enter.\n" +
+                        "--hex sends raw bytes; spaces and hyphens between digits are accepted.\n" +
+                        "--key sends ctrl-c|ctrl-d|ctrl-z|esc|tab|enter|up|down|left|right|backspace.\n" +
+                        "--control is a compatibility alias for --key.\n" +
+                        "Success means input was sent, not that a remote command completed.";
+                    break;
+                case "read":
+                    text = "termwrap read [-s SESSION] [--clear]\n\n" +
+                        "--clear consumes the unread buffer without clearing tail history.\n" +
+                        "--json includes text, dataBase64, startOffset, endOffset and cleared.";
+                    break;
+                case "tail":
+                    text = "termwrap tail [-s SESSION] [--wait]\n\n" +
+                        "--wait waits for a session to appear. Ctrl+C stops following.\n" +
+                        "--json emits newline-delimited events: waiting, data, stopped.\n" +
+                        "Data events include text, dataBase64 and byte offsets. Poll interval: 2s.";
+                    break;
+                case "list":
+                    text = "termwrap list [--all|-a] [--verbose|-v]\n\n" +
+                        "--all includes stopped sessions. --verbose expands human-readable details.\n" +
+                        "--json returns a sessions array, including an empty array when none exist.";
+                    break;
+                case "stop":
+                    text = "termwrap stop [-s SESSION | --all] [--force] [--prune]\n\n" +
+                        "Omission selects exactly one running session; --all explicitly targets all known sessions.\n" +
+                        "--force allows verified-process cleanup after graceful stop fails.\n" +
+                        "--clear-stale is a compatibility alias for --force.\n" +
+                        "--prune also removes the selected stopped session data (compatibility option).\n" +
+                        "--all cannot be combined with --prune; deletion is always limited to one session.";
+                    break;
+                case "prune":
+                    text = "termwrap prune [-s SESSION]\n\n" +
+                        "Delete one stopped session's data, including output logs. Running sessions are never stopped.\n" +
+                        "An explicit active target returns conflict (exit 6). Omission requires exactly one known session.\n" +
+                        "--all is intentionally unsupported; choose each session explicitly.";
+                    break;
+                default: throw CliException.Usage("unknown help topic");
+            }
+            CliOutput.Write(CliOutput.Result("help", "topic", topic, "text", text), text);
+            return 0;
         }
     }
 }
